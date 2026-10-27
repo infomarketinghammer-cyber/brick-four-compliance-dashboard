@@ -1,0 +1,8 @@
+{
+  "name": "brick Four compliance department dashboard",
+  "description": "Enterprise Legal Department KRA \u0026 KPI Management System for Real Estate \u0026 Property Development organizations, featuring hierarchical calculation engine, operational registers, RERA compliance, SLA tracking, and audit workflows.",
+  "requestFramePermissions": [],
+  "majorCapabilities": [
+    "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
+  ]
+}

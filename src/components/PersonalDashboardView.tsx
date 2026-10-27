@@ -46,7 +46,8 @@ interface PersonalDashboardViewProps {
   notify: (message: string, type?: 'success' | 'error') => void;
 }
 
-const MAX_UPLOAD_BYTES = 15 * 1024 * 1024;
+// Vercel functions accept request bodies up to 4.5 MB; base64 adds ~33%, so files are capped at 3 MB
+const MAX_UPLOAD_BYTES = 3 * 1024 * 1024;
 
 export const PersonalDashboardView: React.FC<PersonalDashboardViewProps> = ({
   currentUser,
@@ -146,7 +147,7 @@ export const PersonalDashboardView: React.FC<PersonalDashboardViewProps> = ({
     }
     if (file.size > MAX_UPLOAD_BYTES) {
       setSelectedFile(null);
-      setSubmitError('File is larger than 15 MB. Please upload a smaller document.');
+      setSubmitError('File is larger than 3 MB. Please upload a smaller document.');
       return;
     }
     setSubmitError('');

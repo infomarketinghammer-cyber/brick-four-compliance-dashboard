@@ -40,7 +40,8 @@ interface PerformanceEntryApprovalViewProps {
   onUploadEvidence: (data: Partial<KPIEvidence>) => Promise<void>;
 }
 
-const MAX_EVIDENCE_BYTES = 15 * 1024 * 1024;
+// Vercel functions accept request bodies up to 4.5 MB; base64 adds ~33%, so files are capped at 3 MB
+const MAX_EVIDENCE_BYTES = 3 * 1024 * 1024;
 
 export const PerformanceEntryApprovalView: React.FC<PerformanceEntryApprovalViewProps> = ({
   currentPeriod,
@@ -154,7 +155,7 @@ export const PerformanceEntryApprovalView: React.FC<PerformanceEntryApprovalView
     }
     if (file.size > MAX_EVIDENCE_BYTES) {
       setSelectedEvidenceFile(null);
-      setModalError('File is larger than 15 MB. Please upload a smaller document.');
+      setModalError('File is larger than 3 MB. Please upload a smaller document.');
       return;
     }
     setModalError('');

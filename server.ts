@@ -1,6 +1,9 @@
+import { config as loadEnv } from 'dotenv';
 import express from 'express';
 import path from 'path';
 import crypto from 'crypto';
+
+loadEnv({ path: ['.env.local', '.env'], quiet: true });
 import { createServer as createViteServer } from 'vite';
 import { db } from './server/db.js';
 import {
@@ -30,14 +33,44 @@ interface SessionUser {
   organizationId: string;
 }
 
-interface Session {
-  token: string;
-  user: SessionUser;
-  createdAt: number;
+const SESSION_TTL_MS = 12 * 60 * 60 * 1000; // 12 hours
+
+// Sessions are stateless HMAC-signed tokens so they stay valid across server restarts and across
+// multiple hosted instances (Cloud Run / AI Studio), where an in-memory session map is not shared.
+// The signing key must be identical on every instance: SESSION_SECRET, else derived from GEMINI_API_KEY.
+const SESSION_SECRET = (() => {
+  if (process.env.SESSION_SECRET) return process.env.SESSION_SECRET;
+  if (process.env.GEMINI_API_KEY) {
+    return crypto.createHash('sha256').update(`compliance-dashboard-session:${process.env.GEMINI_API_KEY}`).digest('hex');
+  }
+  console.warn('[auth] SESSION_SECRET is not set; using an insecure development signing key. Set SESSION_SECRET in production.');
+  return 'compliance-dashboard-insecure-dev-session-key';
+})();
+
+// Tokens revoked by logout on this instance (best effort; tokens also expire after SESSION_TTL_MS)
+const revokedTokens = new Map<string, number>();
+
+function signSessionToken(userId: string): string {
+  const payload = Buffer.from(JSON.stringify({ uid: userId, exp: Date.now() + SESSION_TTL_MS, n: crypto.randomBytes(8).toString('hex') })).toString('base64url');
+  const sig = crypto.createHmac('sha256', SESSION_SECRET).update(payload).digest('base64url');
+  return `${payload}.${sig}`;
 }
 
-const SESSION_TTL_MS = 12 * 60 * 60 * 1000; // 12 hours
-const sessions = new Map<string, Session>();
+function verifySessionToken(token: string): { uid: string; exp: number } | null {
+  const [payload, sig] = token.split('.');
+  if (!payload || !sig) return null;
+  const expected = crypto.createHmac('sha256', SESSION_SECRET).update(payload).digest();
+  const given = Buffer.from(sig, 'base64url');
+  if (given.length !== expected.length || !crypto.timingSafeEqual(given, expected)) return null;
+  try {
+    const data = JSON.parse(Buffer.from(payload, 'base64url').toString('utf8'));
+    if (typeof data.uid !== 'string' || typeof data.exp !== 'number' || data.exp < Date.now()) return null;
+    if (revokedTokens.has(token)) return null;
+    return data;
+  } catch {
+    return null;
+  }
+}
 
 const OPERATIONAL_ENTITIES = [
   'contracts',
@@ -143,17 +176,16 @@ async function startServer() {
       token = String(req.headers['x-session-token']);
     }
 
-    let session = token ? sessions.get(token) : undefined;
-    if (session && Date.now() - session.createdAt > SESSION_TTL_MS) {
-      sessions.delete(token);
-      session = undefined;
-    }
+    const claims = token ? verifySessionToken(token) : null;
+    // Always resolve the user fresh from the directory so role changes apply immediately
+    const dbUser = claims ? db.getState().users.find((u) => u.id === claims.uid) : undefined;
+    const user = dbUser ? sanitizeUser(dbUser) : null;
 
-    (req as any).user = session?.user ?? null;
-    (req as any).userId = session?.user.id ?? null;
-    (req as any).userRole = session?.user.role ?? null;
-    (req as any).sessionToken = session ? token : null;
-    (req as any).organizationId = session?.user.organizationId ?? ((req.headers['x-organization-id'] as string) || 'org-apex-01');
+    (req as any).user = user;
+    (req as any).userId = user?.id ?? null;
+    (req as any).userRole = user?.role ?? null;
+    (req as any).sessionToken = user ? token : null;
+    (req as any).organizationId = user?.organizationId ?? ((req.headers['x-organization-id'] as string) || 'org-apex-01');
     next();
   });
 
@@ -212,9 +244,8 @@ async function startServer() {
       return res.status(401).json({ error: 'Invalid email or password.' });
     }
 
-    const token = crypto.randomBytes(32).toString('hex');
+    const token = signSessionToken(user.id);
     const safeUser = sanitizeUser(user);
-    sessions.set(token, { token, user: safeUser, createdAt: Date.now() });
 
     db.addAuditLog({
       organizationId: user.organizationId,
@@ -239,7 +270,11 @@ async function startServer() {
 
   app.post('/api/auth/logout', (req, res) => {
     const token = (req as any).sessionToken;
-    if (token) sessions.delete(token);
+    if (token) {
+      const now = Date.now();
+      for (const [t, exp] of revokedTokens) if (exp < now) revokedTokens.delete(t);
+      revokedTokens.set(token, now + SESSION_TTL_MS);
+    }
     res.json({ success: true });
   });
 

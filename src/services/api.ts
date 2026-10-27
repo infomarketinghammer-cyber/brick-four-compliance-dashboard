@@ -70,8 +70,17 @@ export class ApiError extends Error {
   }
 }
 
+const readStoredToken = () => {
+  try {
+    return localStorage.getItem(TOKEN_KEY) || '';
+  } catch {
+    // storage blocked (sandboxed iframe / private mode) – start signed out
+    return '';
+  }
+};
+
 class ApiService {
-  private token: string = typeof window !== 'undefined' ? localStorage.getItem(TOKEN_KEY) || '' : '';
+  private token: string = typeof window !== 'undefined' ? readStoredToken() : '';
   private unauthorizedHandler: (() => void) | null = null;
 
   public setToken(token: string) {

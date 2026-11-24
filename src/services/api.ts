@@ -62,6 +62,15 @@ export interface ScoringCalculationResponse {
   operationalSummary: OperationalSummary;
 }
 
+export interface StoredDocument {
+  fileName: string;
+  fileType: string;
+  fileSize?: string;
+  /** data: URL of the uploaded file, or '' when no file is stored */
+  fileData: string;
+  hasFile: boolean;
+}
+
 const TOKEN_KEY = 'compliance_session_token';
 
 export class ApiError extends Error {
@@ -250,6 +259,16 @@ class ApiService {
 
   uploadEvidence(data: Partial<KPIEvidence>) {
     return this.request<KPIEvidence>('/api/evidence', { method: 'POST', body: data });
+  }
+
+  /** Fetches one evidence file's contents (access-controlled on the server) */
+  getEvidenceDocument(evidenceId: string) {
+    return this.request<StoredDocument>(`/api/evidence/${encodeURIComponent(evidenceId)}/document`);
+  }
+
+  /** Fetches one submission's uploaded document (access-controlled on the server) */
+  getSubmissionDocument(submissionId: string) {
+    return this.request<StoredDocument>(`/api/submissions/${encodeURIComponent(submissionId)}/document`);
   }
 
   getOperationalEntity<T>(entityName: string) {

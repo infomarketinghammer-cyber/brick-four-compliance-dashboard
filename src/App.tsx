@@ -67,6 +67,7 @@ export default function App() {
   const [auditLogs, setAuditLogs] = useState<AuditLogEntry[]>([]);
   const [notifications, setNotifications] = useState<NotificationItem[]>([]);
   const [reviews, setReviews] = useState<PerformanceReview[]>([]);
+  const [myApprovalsCount, setMyApprovalsCount] = useState<number>(0);
 
   // Operational Lists
   const [contracts, setContracts] = useState<ContractRecord[]>([]);
@@ -163,6 +164,7 @@ export default function App() {
     setBootstrap(null);
     setScoringData(null);
     setAuditLogs([]);
+    setMyApprovalsCount(0);
     setActiveTab('personal_dashboard');
   }, []);
 
@@ -256,6 +258,16 @@ export default function App() {
       await refreshKRAs();
       await refreshCalculations();
     });
+
+  // Poll notifications so approval requests and decisions show up without a reload
+  useEffect(() => {
+    if (!currentUser) return;
+    const timer = setInterval(() => {
+      if (document.visibilityState !== 'visible') return;
+      api.getNotifications().then(setNotifications).catch(() => undefined);
+    }, 30_000);
+    return () => clearInterval(timer);
+  }, [currentUser]);
 
   // Route guard: never render a tab the signed-in role is not allowed to use
   useEffect(() => {
@@ -455,6 +467,8 @@ export default function App() {
   }
 
   const users = bootstrap?.users || [];
+  // The Super Admin governs the system but is not part of the KRA/KPI framework (no own KRAs/KPIs, not in the org chart)
+  const performanceUsers = users.filter((u) => u.role !== 'SUPER_ADMIN');
 
   return (
     <div className="h-screen max-h-screen bg-slate-50 flex text-slate-800 font-sans antialiased overflow-hidden">
@@ -466,6 +480,7 @@ export default function App() {
         isValidWeight={isValidWeight}
         currentUser={currentUser}
         pendingApprovalsCount={currentPeriod.status === 'UNDER_REVIEW' ? 1 : 0}
+        myApprovalsCount={myApprovalsCount}
       />
 
       {/* Right Content Area */}
@@ -508,7 +523,12 @@ export default function App() {
                   kras={kras}
                   kpis={kpis}
                   currentPeriod={currentPeriod}
-                  onSubmissionsChanged={() => refreshCalculations()}
+                  periods={bootstrap?.periods || []}
+                  onSubmissionsChanged={async () => {
+                    await refreshCalculations();
+                    setNotifications(await api.getNotifications());
+                  }}
+                  onPendingCountChange={setMyApprovalsCount}
                   notify={notify}
                 />
               )}
@@ -527,7 +547,7 @@ export default function App() {
               {activeTab === 'kras' && (
                 <KRAFrameworkView
                   kras={kras}
-                  users={users}
+                  users={performanceUsers}
                   canManage={isAdmin(currentUser)}
                   onSaveWeights={handleSaveWeights}
                   onCreateKRA={handleCreateKRA}
@@ -539,7 +559,7 @@ export default function App() {
                 <KPIManagementView
                   kpis={kpis}
                   kras={kras}
-                  users={users}
+                  users={performanceUsers}
                   canManage={isAdmin(currentUser)}
                   onCreateKPI={handleCreateKPI}
                   onUpdateKPI={handleUpdateKPI}
@@ -615,7 +635,7 @@ export default function App() {
               )}
 
               {activeTab === 'employees' && (
-                <EmployeePerformanceView users={users} currentUser={currentUser} currentPeriod={currentPeriod} kpis={kpis} />
+                <EmployeePerformanceView users={performanceUsers} currentUser={currentUser} currentPeriod={currentPeriod} kpis={kpis} />
               )}
 
               {activeTab === 'reviews' && (

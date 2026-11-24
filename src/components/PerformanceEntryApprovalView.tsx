@@ -22,6 +22,8 @@ import {
 } from 'lucide-react';
 import { KPI, KRA, KPIMeasurement, PerformancePeriod, KPIEvidence, User } from '../types';
 import { isAdmin } from '../permissions';
+import { api } from '../services/api';
+import { DocumentViewerModal, downloadDataUrl } from './DocumentViewerModal';
 
 interface PerformanceEntryApprovalViewProps {
   currentPeriod: PerformancePeriod;
@@ -76,6 +78,29 @@ export const PerformanceEntryApprovalView: React.FC<PerformanceEntryApprovalView
   const [evidenceBase64, setEvidenceBase64] = useState<string>('');
   const [evidenceDesc, setEvidenceDesc] = useState<string>('');
   const [isProcessing, setIsProcessing] = useState<boolean>(false);
+  const [viewingEvidence, setViewingEvidence] = useState<KPIEvidence | null>(null);
+
+  // Stored files are fetched from the server on demand; legacy records without a file get a text summary
+  const downloadEvidence = async (ev: KPIEvidence) => {
+    try {
+      const doc = ev.hasFile ? await api.getEvidenceDocument(ev.id) : null;
+      if (doc?.fileData) {
+        downloadDataUrl(doc.fileData, doc.fileName || ev.fileName);
+        return;
+      }
+      const content = `COMPLIANCE VERIFICATION\nDocument: ${ev.fileName} (no stored file)\nUploaded by: ${ev.uploadedBy}\nDate: ${ev.uploadedDate}\nDescription: ${ev.description || 'Verified'}`;
+      const url = URL.createObjectURL(new Blob([content], { type: 'text/plain' }));
+      const link = document.createElement('a');
+      link.href = url;
+      link.download = `${ev.fileName}.txt`;
+      document.body.appendChild(link);
+      link.click();
+      document.body.removeChild(link);
+      setTimeout(() => URL.revokeObjectURL(url), 10_000);
+    } catch (err: any) {
+      setModalError(err?.message || 'Could not download the document.');
+    }
+  };
 
   const isLocked = currentPeriod.status === 'LOCKED';
   const isUnderReview = ['UNDER_REVIEW', 'SUBMITTED', 'APPROVED'].includes(currentPeriod.status);
@@ -690,28 +715,28 @@ export const PerformanceEntryApprovalView: React.FC<PerformanceEntryApprovalView
                       <div className="flex items-center gap-2">
                         <button
                           type="button"
-                          onClick={() => {
-                            const link = document.createElement('a');
-                            if (ev.documentUrl && ev.documentUrl.startsWith('data:')) {
-                              link.href = ev.documentUrl;
-                            } else {
-                              const content = `COMPLIANCE VERIFICATION\nDocument: ${ev.fileName}\nUploaded by: ${ev.uploadedBy}\nDate: ${ev.uploadedDate}\nDescription: ${ev.description || 'Verified'}`;
-                              const blob = new Blob([content], { type: 'text/plain' });
-                              link.href = URL.createObjectURL(blob);
-                            }
-                            link.download = ev.fileName;
-                            document.body.appendChild(link);
-                            link.click();
-                            document.body.removeChild(link);
-                          }}
+                          onClick={() => setViewingEvidence(ev)}
+                          className="px-2 py-1 bg-slate-100 hover:bg-slate-200 text-slate-700 rounded text-[10px] font-bold flex items-center gap-1 transition-all"
+                          title="Preview document"
+                        >
+                          <Eye className="w-3 h-3" />
+                          <span>View</span>
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() => downloadEvidence(ev)}
                           className="px-2 py-1 bg-indigo-50 hover:bg-indigo-100 text-indigo-700 rounded text-[10px] font-bold flex items-center gap-1 transition-all"
                           title="Download document file"
                         >
                           <Download className="w-3 h-3 text-indigo-600" />
                           <span>Download</span>
                         </button>
-                        <span className="text-[10px] font-bold text-emerald-700 bg-emerald-50 px-2 py-0.5 rounded border border-emerald-200">
-                          VERIFIED
+                        <span
+                          className={`text-[10px] font-bold px-2 py-0.5 rounded border ${
+                            ev.hasFile ? 'text-emerald-700 bg-emerald-50 border-emerald-200' : 'text-slate-500 bg-slate-50 border-slate-200'
+                          }`}
+                        >
+                          {ev.hasFile ? 'FILE STORED' : 'NO FILE'}
                         </span>
                       </div>
                     </div>
@@ -794,6 +819,26 @@ export const PerformanceEntryApprovalView: React.FC<PerformanceEntryApprovalView
             )}
           </div>
         </div>
+      )}
+
+      {viewingEvidence && (
+        <DocumentViewerModal
+          fileName={viewingEvidence.fileName}
+          subtitle={`Uploaded by ${viewingEvidence.uploadedBy} on ${viewingEvidence.uploadedDate}`}
+          load={async () =>
+            viewingEvidence.hasFile
+              ? api.getEvidenceDocument(viewingEvidence.id)
+              : { fileName: viewingEvidence.fileName, fileType: viewingEvidence.fileType, fileData: '', hasFile: false }
+          }
+          details={
+            viewingEvidence.description ? (
+              <span>
+                <strong className="text-slate-700">Description:</strong> {viewingEvidence.description}
+              </span>
+            ) : undefined
+          }
+          onClose={() => setViewingEvidence(null)}
+        />
       )}
 
       {/* Modal: Reopen Locked Period */}

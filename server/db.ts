@@ -31,6 +31,71 @@ import {
   autoCalculateKPIActual,
   calculateOperationalMetrics,
 } from './calculationEngine.js';
+import { MongoClient, type Db, type AnyBulkWriteOperation } from 'mongodb';
+import crypto from 'crypto';
+import { hashPassword, isHashedPassword } from './passwords.js';
+
+/**
+ * System administrator account. A SUPER_ADMIN governs the whole system but is not a participant in the
+ * department's performance framework, so it never carries its own KRAs or KPIs and has no reporting manager.
+ */
+const SUPER_ADMIN_HEMANT = (orgId: string): User => ({
+  id: 'usr-hemant',
+  organizationId: orgId,
+  name: 'Hemant',
+  email: 'hemant@brickfour.com',
+  password: 'Hemant@123',
+  role: 'SUPER_ADMIN',
+  designation: 'Super Administrator',
+  department: 'Administration',
+  wing: 'Administration',
+  level: 1,
+  managerId: null,
+  managerName: null,
+  subordinateIds: [],
+  activeMatters: 0,
+  status: 'ON_TRACK',
+  assignedKras: [],
+  assignedKpis: [],
+});
+
+// ---------------------------------------------------------------------------------------------
+// MongoDB persistence
+// The route handlers work against an in-memory copy of the state (fast, synchronous code paths).
+// Before each API request the copy is refreshed from MongoDB when another server instance changed it,
+// and after each mutating request every changed record is written back. This keeps all instances
+// (local server, every Vercel serverless instance) looking at the same data.
+// Without MONGODB_URI the app falls back to a process-local in-memory store (data resets on restart).
+// ---------------------------------------------------------------------------------------------
+
+const MONGODB_URI = process.env.MONGODB_URI || '';
+const MONGODB_DB = process.env.MONGODB_DB || '';
+const DEFAULT_DB_NAME = 'brickfour_compliance';
+
+const FILE_REF_PREFIX = 'file:';
+
+type ArrayCollection = Exclude<keyof DatabaseState, 'scoringSettings'>;
+
+const ARRAY_COLLECTIONS: ArrayCollection[] = [
+  'organizations', 'companies', 'projects', 'users', 'financialYears', 'periods', 'kras', 'kpis', 'targets',
+  'measurements', 'evidence', 'submissions', 'contracts', 'compliances', 'litigations', 'notices', 'risks',
+  'dueDiligences', 'approvals', 'transactions', 'tasks', 'auditLogs', 'notifications', 'reviews',
+];
+
+// Collections the app keeps newest-first (new records are unshift()-ed); everything else is insertion order
+const NEWEST_FIRST: ReadonlySet<ArrayCollection> = new Set<ArrayCollection>([
+  'submissions', 'auditLogs', 'reviews', 'notifications', 'contracts', 'compliances', 'litigations', 'notices',
+  'risks', 'dueDiligences', 'approvals', 'transactions', 'tasks',
+]);
+
+interface SnapshotEntry {
+  json: string;
+  seq: number;
+}
+
+export interface StoredFile {
+  dataUrl: string;
+}
 
 export interface DatabaseState {
   organizations: Organization[];
@@ -64,12 +129,326 @@ export interface DatabaseState {
 class MemoryDatabase {
   private state: DatabaseState;
 
+  // Persistence bookkeeping
+  private mongo: Db | null = null;
+  private connecting: Promise<void> | null = null;
+  private loadedVersion = -1;
+  private snapshot = new Map<string, Map<string, SnapshotEntry>>();
+  private seqCounter = 0;
+  private queue: Promise<unknown> = Promise.resolve();
+  /** Uploaded documents keyed by content hash (also the in-memory store when MongoDB is not configured) */
+  private files = new Map<string, StoredFile>();
+  private pendingFiles = new Map<string, StoredFile>();
+
   constructor() {
     this.state = this.seedDatabase();
+    this.applyMigrations();
+    this.externalizeFiles();
+    if (!MONGODB_URI) {
+      console.warn('[db] MONGODB_URI is not set: using a process-local in-memory store. Data resets on restart and is NOT shared between server instances.');
+    }
   }
 
   public getState(): DatabaseState {
     return this.state;
+  }
+
+  public isPersistent(): boolean {
+    return Boolean(MONGODB_URI);
+  }
+
+  /** Runs persistence work one task at a time so a reload never interleaves with a write */
+  private exclusive<T>(task: () => Promise<T>): Promise<T> {
+    const run = this.queue.then(task, task);
+    this.queue = run.catch(() => undefined);
+    return run;
+  }
+
+  private nextSeq(): number {
+    this.seqCounter = (this.seqCounter + 1) % 1000;
+    return Date.now() * 1000 + this.seqCounter;
+  }
+
+  /** Connects (once) and refreshes the in-memory copy if another instance changed the data. Call before each request. */
+  public async ready(): Promise<void> {
+    if (!MONGODB_URI) return;
+    if (!this.connecting) {
+      this.connecting = this.exclusive(() => this.connect()).catch((err) => {
+        this.connecting = null;
+        this.mongo = null;
+        throw err;
+      });
+    }
+    await this.connecting;
+    await this.exclusive(() => this.refresh());
+  }
+
+  private async connect(): Promise<void> {
+    const client = new MongoClient(MONGODB_URI, { ignoreUndefined: true, serverSelectionTimeoutMS: 8000 });
+    await client.connect();
+    const mongo = client.db(MONGODB_DB || undefined);
+    this.mongo = mongo.databaseName === 'test' && !MONGODB_DB ? client.db(DEFAULT_DB_NAME) : mongo;
+
+    const meta = this.mongo.collection<{ _id: string; version: number }>('_meta');
+    let current = await meta.findOne({ _id: 'state' });
+
+    if (!current) {
+      // First start against an empty database: claim the seeding (only one instance wins) and write the seed data
+      let claimed = false;
+      try {
+        await meta.insertOne({ _id: 'state', version: 0 });
+        claimed = true;
+      } catch {
+        claimed = false;
+      }
+      if (claimed) {
+        this.snapshot.clear();
+        await this.writeChanges(this.computeChanges(true));
+        await meta.updateOne({ _id: 'state' }, { $set: { version: 1, seededAt: new Date().toISOString() } });
+        console.log(`[db] Seeded MongoDB database "${this.mongo.databaseName}"`);
+      } else {
+        for (let i = 0; i < 40 && (!current || current.version === 0); i++) {
+          await new Promise((r) => setTimeout(r, 250));
+          current = await meta.findOne({ _id: 'state' });
+        }
+      }
+    }
+
+    await this.loadAll();
+
+    // Data migrations against existing databases (idempotent): e.g. ensure the Super Admin account exists
+    if (this.applyMigrations()) {
+      await this.writeChanges(this.computeChanges(false));
+    }
+    console.log(`[db] Connected to MongoDB database "${this.mongo.databaseName}"`);
+  }
+
+  private async refresh(): Promise<void> {
+    if (!this.mongo) return;
+    const meta = await this.mongo.collection<{ _id: string; version: number }>('_meta').findOne({ _id: 'state' });
+    if (meta && meta.version !== this.loadedVersion) {
+      await this.loadAll();
+    }
+  }
+
+  private async loadAll(): Promise<void> {
+    if (!this.mongo) return;
+    const mongo = this.mongo;
+    const meta = await mongo.collection<{ _id: string; version: number }>('_meta').findOne({ _id: 'state' });
+
+    const loaded = await Promise.all(
+      ARRAY_COLLECTIONS.map(async (name) => {
+        const docs = await mongo
+          .collection(name)
+          .find({})
+          .sort({ _seq: NEWEST_FIRST.has(name) ? -1 : 1 })
+          .toArray();
+        return [name, docs] as const;
+      })
+    );
+    const settingsDocs = await mongo.collection('scoringSettings').find({}).toArray();
+
+    const next: any = {};
+    this.snapshot.clear();
+    for (const [name, docs] of loaded) {
+      const snap = new Map<string, SnapshotEntry>();
+      next[name] = docs.map((doc) => {
+        const { _id, _seq, ...item } = doc as any;
+        snap.set(String(item.id ?? _id), { json: JSON.stringify(item), seq: Number(_seq) || 0 });
+        return item;
+      });
+      this.snapshot.set(name, snap);
+    }
+
+    const settingsSnap = new Map<string, SnapshotEntry>();
+    next.scoringSettings = {};
+    for (const doc of settingsDocs) {
+      const { _id, _seq, ...settings } = doc as any;
+      next.scoringSettings[String(_id)] = settings;
+      settingsSnap.set(String(_id), { json: JSON.stringify(settings), seq: Number(_seq) || 0 });
+    }
+    this.snapshot.set('scoringSettings', settingsSnap);
+
+    this.state = next as DatabaseState;
+    this.loadedVersion = meta?.version ?? 0;
+  }
+
+  /** Diffs the in-memory state against what was last loaded/written and returns the pending MongoDB operations */
+  private computeChanges(isSeed: boolean): Map<string, AnyBulkWriteOperation<any>[]> {
+    this.externalizeFiles();
+    const changes = new Map<string, AnyBulkWriteOperation<any>[]>();
+
+    const diff = (name: string, entries: Array<[string, any]>, seedOrder: (index: number) => number) => {
+      const prev = this.snapshot.get(name) || new Map<string, SnapshotEntry>();
+      const next = new Map<string, SnapshotEntry>();
+      const ops: AnyBulkWriteOperation<any>[] = [];
+      entries.forEach(([id, item], index) => {
+        if (!id || next.has(id)) return;
+        const json = JSON.stringify(item);
+        const old = prev.get(id);
+        const seq = old ? old.seq : isSeed ? seedOrder(index) : this.nextSeq();
+        next.set(id, { json, seq });
+        if (!old || old.json !== json) {
+          ops.push({ replaceOne: { filter: { _id: id }, replacement: { ...item, _id: id, _seq: seq }, upsert: true } });
+        }
+      });
+      for (const id of prev.keys()) {
+        if (!next.has(id)) ops.push({ deleteOne: { filter: { _id: id } } });
+      }
+      this.snapshot.set(name, next);
+      if (ops.length) changes.set(name, ops);
+    };
+
+    for (const name of ARRAY_COLLECTIONS) {
+      const items = (this.state[name] as any[]) || [];
+      const n = items.length;
+      // Seed records keep their original display order once sorted on load
+      diff(name, items.map((item) => [String(item?.id ?? ''), item]), (i) => (NEWEST_FIRST.has(name) ? n - i : i));
+    }
+    diff('scoringSettings', Object.entries(this.state.scoringSettings || {}), (i) => i);
+
+    if (this.pendingFiles.size) {
+      changes.set(
+        'files',
+        [...this.pendingFiles.entries()].map(([id, file]) => ({
+          replaceOne: { filter: { _id: id }, replacement: { _id: id, ...file }, upsert: true },
+        }))
+      );
+    }
+    return changes;
+  }
+
+  private async writeChanges(changes: Map<string, AnyBulkWriteOperation<any>[]>): Promise<boolean> {
+    if (!this.mongo || changes.size === 0) return false;
+    const mongo = this.mongo;
+    // Files first, so a record never references a document that is not stored yet
+    const files = changes.get('files');
+    if (files) {
+      await mongo.collection('files').bulkWrite(files, { ordered: false });
+      this.pendingFiles.clear();
+    }
+    await Promise.all(
+      [...changes.entries()]
+        .filter(([name]) => name !== 'files')
+        .map(([name, ops]) => mongo.collection(name).bulkWrite(ops, { ordered: false }))
+    );
+    return true;
+  }
+
+  /** Persists everything the current request changed. Called by the API layer before it responds. */
+  public async commit(): Promise<void> {
+    if (!MONGODB_URI) {
+      this.externalizeFiles();
+      return;
+    }
+    // The diff is taken synchronously, so it reflects exactly this request's mutations
+    const changes = this.computeChanges(false);
+    if (changes.size === 0) return;
+    const baseVersion = this.loadedVersion;
+    await this.exclusive(async () => {
+      if (!this.mongo) throw new Error('Database connection is not available.');
+      // A reload that ran after the diff was taken replaced the in-memory state without these changes
+      const reloadedMeanwhile = this.loadedVersion !== baseVersion;
+      await this.writeChanges(changes);
+      const meta = await this.mongo
+        .collection<{ _id: string; version: number }>('_meta')
+        .findOneAndUpdate({ _id: 'state' }, { $inc: { version: 1 } }, { returnDocument: 'after', upsert: true });
+      const newVersion = (meta as any)?.version ?? (meta as any)?.value?.version;
+      // If anything else changed the data in between, force a full reload on the next request
+      this.loadedVersion = !reloadedMeanwhile && newVersion === baseVersion + 1 ? newVersion : -1;
+    });
+  }
+
+  /**
+   * Idempotent data fixes applied at startup (seed and existing databases alike). Returns true if anything changed.
+   * - The Super Admin (Hemant) account exists, with no reporting manager and no self KRAs/KPIs.
+   * - Stored passwords are hashed.
+   */
+  private applyMigrations(): boolean {
+    let changed = false;
+    const orgId = this.state.organizations[0]?.id || 'org-apex-01';
+
+    const existing = this.state.users.find((u) => u.email.toLowerCase() === 'hemant@brickfour.com');
+    if (!existing) {
+      this.state.users.push(SUPER_ADMIN_HEMANT(orgId));
+      changed = true;
+    } else if (existing.role !== 'SUPER_ADMIN') {
+      existing.role = 'SUPER_ADMIN';
+      changed = true;
+    }
+
+    for (const u of this.state.users) {
+      if (u.role === 'SUPER_ADMIN') {
+        if (u.assignedKras?.length || u.assignedKpis?.length || u.managerId) {
+          u.assignedKras = [];
+          u.assignedKpis = [];
+          u.managerId = null;
+          u.managerName = null;
+          changed = true;
+        }
+      }
+      if (u.password && !isHashedPassword(u.password)) {
+        u.password = hashPassword(u.password);
+        changed = true;
+      }
+    }
+    return changed;
+  }
+
+  // ---------------- Uploaded documents ----------------
+
+  /** Moves inline base64 documents out of records into the file store, leaving a `file:<hash>` reference */
+  private externalizeFiles(): void {
+    const toRef = (value: unknown): string | undefined => {
+      if (typeof value !== 'string' || !value.startsWith('data:')) return undefined;
+      const id = crypto.createHash('sha256').update(value).digest('hex');
+      if (!this.files.has(id)) {
+        this.files.set(id, { dataUrl: value });
+        if (MONGODB_URI) this.pendingFiles.set(id, { dataUrl: value });
+      }
+      return `${FILE_REF_PREFIX}${id}`;
+    };
+    for (const s of this.state.submissions) {
+      const ref = toRef(s.document?.fileData);
+      if (ref) s.document.fileData = ref;
+    }
+    for (const e of this.state.evidence) {
+      const ref = toRef(e.documentUrl);
+      if (ref) e.documentUrl = ref;
+    }
+  }
+
+  public hasStoredFile(ref: string | undefined): boolean {
+    return typeof ref === 'string' && (ref.startsWith(FILE_REF_PREFIX) || ref.startsWith('data:'));
+  }
+
+  /** Resolves a stored document reference to its data URL (or null if there is no stored file) */
+  public async getFile(ref: string | undefined): Promise<string | null> {
+    if (!ref) return null;
+    if (ref.startsWith('data:')) return ref;
+    if (!ref.startsWith(FILE_REF_PREFIX)) return null;
+    const id = ref.slice(FILE_REF_PREFIX.length);
+    const cached = this.files.get(id);
+    if (cached) return cached.dataUrl;
+    if (!this.mongo) return null;
+    const doc = await this.mongo.collection<{ _id: string; dataUrl: string }>('files').findOne({ _id: id });
+    if (!doc) return null;
+    this.files.set(id, { dataUrl: doc.dataUrl });
+    return doc.dataUrl;
+  }
+
+  // ---------------- Notifications ----------------
+
+  /** Adds a notification. With `userId` it is private to that user; without, it is visible to the whole organization. */
+  public notify(entry: Omit<NotificationItem, 'id' | 'timestamp' | 'read'>): NotificationItem {
+    const item: NotificationItem = {
+      ...entry,
+      id: `notif-${Date.now()}-${Math.floor(Math.random() * 100000)}`,
+      timestamp: new Date().toISOString().replace('T', ' ').substring(0, 19),
+      read: false,
+    };
+    this.state.notifications.unshift(item);
+    return item;
   }
 
   private seedDatabase(): DatabaseState {
@@ -233,6 +612,7 @@ class MemoryDatabase {
         assignedKras: ['kra-03', 'kra-04'],
         assignedKpis: ['kpi-03-01', 'kpi-03-02', 'kpi-04-01', 'kpi-04-02'],
       },
+      SUPER_ADMIN_HEMANT(orgId),
     ];
 
     const financialYears: FinancialYear[] = [
@@ -2390,6 +2770,15 @@ class MemoryDatabase {
       newValue: `${submission.employeeName} submitted deliverable for ${submission.kpiName} with confidential document: ${submission.document.fileName}. Routed strictly to Org-Chart Manager ${submission.managerName}.`,
     });
 
+    this.notify({
+      organizationId: submission.organizationId,
+      userId: submission.managerId,
+      title: 'Approval required',
+      message: `${submission.employeeName} submitted ${submission.kpiCode} (${submission.kpiName}) with document "${submission.document.fileName}" for your approval.`,
+      type: 'APPROVAL',
+      linkTab: 'personal_dashboard',
+    });
+
     return submission;
   }
 
@@ -2546,6 +2935,15 @@ class MemoryDatabase {
           };
           this.state.submissions.unshift(mgrRollupSub);
         }
+
+        this.notify({
+          organizationId: sub.organizationId,
+          userId: gm.id,
+          title: 'Wing rollup awaiting sign-off',
+          message: `${manager.name}'s consolidated package (${approvedCount}/${totalTeamCount} staff deliverables approved) needs your executive sign-off.`,
+          type: 'APPROVAL',
+          linkTab: 'personal_dashboard',
+        });
       }
 
       // Now roll up to the Head of Department (Level 1)
@@ -2573,6 +2971,15 @@ class MemoryDatabase {
       entity: 'KPI_SUBMISSION',
       entityId: sub.id,
       newValue: `${approverName} approved deliverable from ${sub.employeeName}. Awarded ${sub.pointsAwarded} points. Hierarchical roll-up updated to Upper Manager KRA.`,
+    });
+
+    this.notify({
+      organizationId: sub.organizationId,
+      userId: sub.employeeId,
+      title: 'Deliverable approved',
+      message: `${approverName} approved your ${sub.kpiCode} deliverable and awarded ${sub.pointsAwarded} points.`,
+      type: 'INFO',
+      linkTab: 'personal_dashboard',
     });
 
     return { submission: sub, rolledUpKras };
@@ -2686,6 +3093,15 @@ class MemoryDatabase {
       newValue: `${rejectorName} requested revision for ${sub.employeeName}: ${remarks}`,
     });
 
+    this.notify({
+      organizationId: sub.organizationId,
+      userId: sub.employeeId,
+      title: 'Revision requested',
+      message: `${rejectorName} sent back your ${sub.kpiCode} deliverable: ${remarks}`,
+      type: 'ALERT',
+      linkTab: 'personal_dashboard',
+    });
+
     return sub;
   }
 
@@ -2701,18 +3117,25 @@ class MemoryDatabase {
         (s) => s.organizationId === orgId && s.periodId === periodId && s.employeeId === staff.id
       );
       const approvedCount = staffSubmissions.filter((s) => s.status === 'APPROVED').length;
+      const pendingCount = staffSubmissions.filter((s) => s.status === 'PENDING_APPROVAL').length;
+      const rejectedCount = staffSubmissions.filter((s) => s.status === 'REJECTED').length;
       const completionRate = staffSubmissions.length > 0 ? Math.round((approvedCount / staffSubmissions.length) * 100) : 0;
       const points = staffSubmissions.reduce((acc, s) => acc + s.pointsAwarded, 0);
 
+      // Counts only: the submissions themselves (and their confidential documents) are served by /api/submissions
       return {
         id: staff.id,
         name: staff.name,
         designation: staff.designation,
         level: 3,
         wing: staff.wing,
+        managerId: staff.managerId,
         completionRate,
         points,
-        submissions: staffSubmissions,
+        submittedCount: staffSubmissions.length,
+        approvedCount,
+        pendingCount,
+        rejectedCount,
         isCompleted: approvedCount > 0,
       };
     };
@@ -2746,6 +3169,7 @@ class MemoryDatabase {
       ...directStaffNodes.map((s) => s.completionRate),
     ];
     const gmRollupScore = headInputs.length > 0 ? Math.round(headInputs.reduce((a, b) => a + b, 0) / headInputs.length) : 0;
+    const allStaff = [...managerNodes.flatMap((m) => m.subordinates), ...directStaffNodes];
 
     return {
       periodId,
@@ -2757,6 +3181,10 @@ class MemoryDatabase {
         department: gm.department,
         departmentRollupScore: gmRollupScore,
         isCompleted: gmRollupScore >= 100,
+        totalStaff: allStaff.length,
+        totalSubmitted: allStaff.reduce((a, s) => a + s.submittedCount, 0),
+        totalApproved: allStaff.reduce((a, s) => a + s.approvedCount, 0),
+        totalPending: allStaff.reduce((a, s) => a + s.pendingCount, 0),
       },
       managers: managerNodes,
       directStaff: directStaffNodes,

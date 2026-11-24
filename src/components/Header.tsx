@@ -94,7 +94,7 @@ export const Header: React.FC<HeaderProps> = ({
 
                 <div className="hidden md:flex items-center gap-1 pl-1">
                   <span className="text-[10px] font-bold px-2 py-0.5 rounded-md bg-white/20 text-white border border-white/30">
-                    {currentUser.level === 1 ? 'HOD' : currentUser.level === 2 ? 'Manager' : 'Staff'}
+                    {currentUser.role === 'SUPER_ADMIN' ? 'Super Admin' : currentUser.level === 1 ? 'HOD' : currentUser.level === 2 ? 'Manager' : 'Staff'}
                   </span>
                   {currentUser.wing && (
                     <span className="text-[9px] font-semibold px-1.5 py-0.5 rounded bg-white/10 text-teal-100">

@@ -214,6 +214,8 @@ export interface KPIEvidence {
   uploadedDate: string;
   description: string;
   documentUrl?: string;
+  /** True when an uploaded file is stored for this evidence (fetch it from /api/evidence/:id/document) */
+  hasFile?: boolean;
 }
 
 export interface KPISubmissionDocument {
@@ -223,6 +225,8 @@ export interface KPISubmissionDocument {
   fileData?: string;
   description?: string;
   isRestricted?: boolean;
+  /** True when an uploaded file is stored for this submission (fetch it from /api/submissions/:id/document) */
+  hasFile?: boolean;
 }
 
 export interface KPISubmission {
@@ -598,6 +602,8 @@ export interface NotificationItem {
   timestamp: string;
   read: boolean;
   linkTab?: string;
+  /** When set, the notification is private to this user; otherwise it is visible organization-wide */
+  userId?: string;
 }
 
 export interface PerformanceReview {

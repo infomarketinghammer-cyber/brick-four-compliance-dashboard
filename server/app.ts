@@ -11,6 +11,7 @@ import {
   calculateOperationalMetrics,
 } from './calculationEngine.js';
 import { askLegalIntelligenceAssistant } from './gemini.js';
+import { verifyPassword } from './passwords.js';
 import type { KRA, KPI, KPIMeasurement, UserRole, PerformancePeriod, ScoringSettings } from '../src/types.js';
 
 interface SessionUser {
@@ -109,12 +110,8 @@ function sanitizeUser(user: any): SessionUser {
   return safeUser as SessionUser;
 }
 
-function hashPassword(raw: string): Buffer {
-  return crypto.createHash('sha256').update(raw).digest();
-}
-
 function passwordsMatch(input: string, stored: string): boolean {
-  return crypto.timingSafeEqual(hashPassword(input), hashPassword(stored));
+  return verifyPassword(input, stored);
 }
 
 function pick<T extends object>(source: any, fields: readonly string[]): Partial<T> {
@@ -162,6 +159,32 @@ export function createApp() {
 
   app.use(express.json({ limit: '25mb' }));
 
+  // Shared persistence: load the latest data before every API request, and save what a mutating
+  // request changed before its response is sent (so the next request, on any instance, sees it)
+  app.use('/api', async (req, res, next) => {
+    try {
+      await db.ready();
+    } catch (err: any) {
+      console.error('[db] Database unavailable:', err);
+      return res.status(503).json({ error: 'The database is currently unavailable. Please try again in a moment.' });
+    }
+    if (req.method !== 'GET' && req.method !== 'HEAD') {
+      const sendJson = res.json.bind(res);
+      res.json = ((body: any) => {
+        db.commit().then(
+          () => sendJson(body),
+          (err) => {
+            console.error('[db] Failed to save changes:', err);
+            res.status(500);
+            sendJson({ error: 'Your change could not be saved to the database. Please try again.' });
+          }
+        );
+        return res;
+      }) as any;
+    }
+    next();
+  });
+
   // Session authentication: the organization is always taken from the verified session, never from a client header
   app.use((req, res, next) => {
     const authHeader = req.headers['authorization'];
@@ -207,15 +230,38 @@ export function createApp() {
     next();
   };
 
+  // Default KRA/KPI owner: the caller, unless the caller is the Super Admin (who has no own KRAs/KPIs) -> the HOD
+  const defaultOwner = (orgId: string, caller: SessionUser) => {
+    if (caller.role !== 'SUPER_ADMIN') return caller;
+    const users = db.getState().users.filter((u) => u.organizationId === orgId);
+    return users.find((u) => u.role === 'LEGAL_HEAD') || users.find((u) => u.role !== 'SUPER_ADMIN') || caller;
+  };
+
   // Audit identity of the authenticated caller
   const actor = (req: express.Request) => {
     const u = (req as any).user as SessionUser;
     return { userId: u.id, userName: u.name, userRole: u.role };
   };
 
+  // Submission document files: the submitter, their direct manager, the HOD, SUPER_ADMIN and AUDITOR
+  const canAccessSubmissionFile = (u: SessionUser, s: { employeeId: string; managerId: string }) => {
+    const isOwner = s.employeeId === u.id;
+    const isDirectManager = s.managerId === u.id;
+    const isHOD = u.level === 1 && (u.role === 'LEGAL_HEAD' || u.role === 'MANAGEMENT');
+    const isAdminOrAuditor = u.role === 'SUPER_ADMIN' || u.role === 'AUDITOR';
+    return isOwner || isDirectManager || isHOD || isAdminOrAuditor;
+  };
+
+  // Evidence files: those created from a submission follow that submission's rule; others are governance documents
+  const canAccessEvidenceFile = (u: SessionUser, ev: { id: string }) => {
+    const sub = db.getState().submissions.find((s) => `ev-${s.id}` === ev.id);
+    if (sub) return canAccessSubmissionFile(u, sub);
+    return isAdminRole(u.role) || u.role === 'AUDITOR' || u.role === 'MANAGEMENT';
+  };
+
   // Health check
   app.get('/api/health', (req, res) => {
-    res.json({ status: 'ok', timestamp: new Date().toISOString() });
+    res.json({ status: 'ok', timestamp: new Date().toISOString(), persistence: db.isPersistent() ? 'mongodb' : 'memory' });
   });
 
   // Authentication: login by corporate email (or its local part) and exact password
@@ -341,7 +387,11 @@ export function createApp() {
       return res.status(400).json({ error: 'KRA weight must be a number between 0 and 100.' });
     }
 
-    const owner = state.users.find((u) => u.id === ownerId && u.organizationId === orgId) || (req as any).user;
+    const requestedOwner = state.users.find((u) => u.id === ownerId && u.organizationId === orgId);
+    if (requestedOwner?.role === 'SUPER_ADMIN') {
+      return res.status(400).json({ error: 'The Super Admin account cannot own KRAs. Choose a department member as owner.' });
+    }
+    const owner = requestedOwner || defaultOwner(orgId, (req as any).user);
     const orgKras = state.kras.filter((k) => k.organizationId === orgId);
 
     const newKRA: KRA = {
@@ -384,6 +434,13 @@ export function createApp() {
     }
 
     const updates = pick<KRA>(req.body, KRA_EDITABLE_FIELDS);
+    if (updates.ownerId) {
+      const owner = state.users.find((u) => u.id === updates.ownerId && u.organizationId === orgId);
+      if (owner?.role === 'SUPER_ADMIN') {
+        return res.status(400).json({ error: 'The Super Admin account cannot own KRAs. Choose a department member as owner.' });
+      }
+      if (owner) updates.ownerName = owner.name;
+    }
     if (updates.weight !== undefined) {
       if (!isFiniteNumber(updates.weight) || Number(updates.weight) < 0 || Number(updates.weight) > 100) {
         return res.status(400).json({ error: 'KRA weight must be a number between 0 and 100.' });
@@ -516,7 +573,11 @@ export function createApp() {
     const validationError = validateKpiPayload(orgId, { ...data, kpiCode }, true);
     if (validationError) return res.status(400).json({ error: validationError });
 
-    const owner = state.users.find((u) => u.id === data.ownerId && u.organizationId === orgId) || currentUser;
+    const requestedOwner = state.users.find((u) => u.id === data.ownerId && u.organizationId === orgId);
+    if (requestedOwner?.role === 'SUPER_ADMIN') {
+      return res.status(400).json({ error: 'The Super Admin account cannot own KPIs. Choose a department member as owner.' });
+    }
+    const owner = requestedOwner || defaultOwner(orgId, currentUser);
 
     const newKPI: KPI = {
       id: `kpi-${Date.now()}`,
@@ -574,6 +635,9 @@ export function createApp() {
     }
     if (updates.ownerId) {
       const owner = state.users.find((u) => u.id === updates.ownerId && u.organizationId === orgId);
+      if (owner?.role === 'SUPER_ADMIN') {
+        return res.status(400).json({ error: 'The Super Admin account cannot own KPIs. Choose a department member as owner.' });
+      }
       if (owner) updates.ownerName = owner.name;
     }
 
@@ -1114,11 +1178,35 @@ export function createApp() {
     const kpiId = req.query.kpiId as string;
     const state = db.getState();
 
+    const currentUser = (req as any).user as SessionUser;
     let list = state.evidence.filter((e) => e.organizationId === orgId);
     if (periodId) list = list.filter((e) => e.periodId === periodId);
     if (kpiId) list = list.filter((e) => e.kpiId === kpiId);
 
-    res.json(list);
+    // Uploaded file contents are fetched individually from /api/evidence/:id/document
+    res.json(
+      list.map((e) => {
+        const stored = db.hasStoredFile(e.documentUrl);
+        return {
+          ...e,
+          documentUrl: stored ? '' : e.documentUrl,
+          hasFile: stored,
+          isRestricted: !canAccessEvidenceFile(currentUser, e),
+        };
+      })
+    );
+  });
+
+  app.get('/api/evidence/:id/document', async (req, res) => {
+    const orgId = (req as any).organizationId;
+    const currentUser = (req as any).user as SessionUser;
+    const ev = db.getState().evidence.find((e) => e.id === req.params.id && e.organizationId === orgId);
+    if (!ev) return res.status(404).json({ error: 'Evidence not found' });
+    if (!canAccessEvidenceFile(currentUser, ev)) {
+      return res.status(403).json({ error: 'Access restricted: you are not permitted to open this evidence document.' });
+    }
+    const fileData = await db.getFile(ev.documentUrl);
+    res.json({ fileName: ev.fileName, fileType: ev.fileType, fileSize: ev.fileSize, fileData: fileData || '', hasFile: Boolean(fileData) });
   });
 
   app.post('/api/evidence', requireAdmin, (req, res) => {
@@ -1131,7 +1219,7 @@ export function createApp() {
     if (!kpi) return res.status(404).json({ error: 'KPI not found' });
     const lockErr = getLockedPeriodError(orgId, data.periodId);
     if (lockErr) return res.status(lockErr.status).json({ error: lockErr.error });
-    if (!data.fileName || !data.documentUrl) {
+    if (!data.fileName || typeof data.documentUrl !== 'string' || !data.documentUrl.startsWith('data:')) {
       return res.status(400).json({ error: 'A real evidence document must be uploaded.' });
     }
 
@@ -1181,26 +1269,39 @@ export function createApp() {
       currentUserId: currentUser.id,
     });
 
-    // Evidence FILE contents are restricted to the submitter, their direct manager, the HOD, and SUPER_ADMIN / AUDITOR
-    const sanitized = submissions.map((s) => {
-      const isOwner = s.employeeId === currentUser.id;
-      const isDirectManager = s.managerId === currentUser.id;
-      const isHOD = currentUser.level === 1 && (currentUser.role === 'LEGAL_HEAD' || currentUser.role === 'MANAGEMENT');
-      const isAdminOrAuditor = currentUser.role === 'SUPER_ADMIN' || currentUser.role === 'AUDITOR';
-
-      const canAccessFile = isOwner || isDirectManager || isHOD || isAdminOrAuditor;
-
-      return {
-        ...s,
-        document: {
-          ...s.document,
-          fileData: canAccessFile ? s.document.fileData : '',
-          isRestricted: !canAccessFile,
-        },
-      };
-    });
+    // File contents are never embedded in the list; they are fetched one at a time from /api/submissions/:id/document
+    const sanitized = submissions.map((s) => ({
+      ...s,
+      document: {
+        ...s.document,
+        fileData: '',
+        hasFile: db.hasStoredFile(s.document?.fileData),
+        isRestricted: !canAccessSubmissionFile(currentUser, s),
+      },
+    }));
 
     res.json(sanitized);
+  });
+
+  // Download / preview one submission's uploaded document (access-controlled)
+  app.get('/api/submissions/:id/document', async (req, res) => {
+    const orgId = (req as any).organizationId;
+    const currentUser = (req as any).user as SessionUser;
+    const sub = db.getState().submissions.find((s) => s.id === req.params.id && s.organizationId === orgId);
+    if (!sub) return res.status(404).json({ error: 'Submission not found' });
+    if (!canAccessSubmissionFile(currentUser, sub)) {
+      return res.status(403).json({
+        error: 'Access restricted: evidence files are confidential to the submitter, their reporting manager, the Head of Department and auditors.',
+      });
+    }
+    const fileData = await db.getFile(sub.document?.fileData);
+    res.json({
+      fileName: sub.document?.fileName,
+      fileType: sub.document?.fileType,
+      fileSize: sub.document?.fileSize,
+      fileData: fileData || '',
+      hasFile: Boolean(fileData),
+    });
   });
 
   // Submit KRA deliverable with real evidence file upload
@@ -1510,16 +1611,21 @@ export function createApp() {
   });
 
   // Notifications API
-  app.get('/api/notifications', (req, res) => {
+  // Organization-wide notifications plus the ones addressed to the signed-in user
+  const visibleNotifications = (req: express.Request) => {
     const orgId = (req as any).organizationId;
-    res.json(db.getState().notifications.filter((n) => n.organizationId === orgId));
+    const userId = (req as any).userId;
+    return db.getState().notifications.filter((n) => n.organizationId === orgId && (!n.userId || n.userId === userId));
+  };
+
+  app.get('/api/notifications', (req, res) => {
+    res.json(visibleNotifications(req));
   });
 
   app.post('/api/notifications/mark-read', (req, res) => {
-    const orgId = (req as any).organizationId;
     const id = req.body?.id;
-    for (const n of db.getState().notifications) {
-      if (n.organizationId === orgId && (!id || n.id === id)) {
+    for (const n of visibleNotifications(req)) {
+      if (!id || n.id === id) {
         n.read = true;
       }
     }

@@ -1,12 +1,7 @@
-import React, { useState, useEffect } from 'react';
-import {
-  User,
-  KRA,
-  KPI,
-  PerformancePeriod,
-  KPISubmission,
-} from '../types';
+import React, { useState, useEffect, useCallback } from 'react';
+import { User, KRA, KPI, PerformancePeriod, KPISubmission } from '../types';
 import { api } from '../services/api';
+import { DocumentViewerModal, downloadDataUrl } from './DocumentViewerModal';
 import {
   Award,
   CheckCircle2,
@@ -16,23 +11,16 @@ import {
   Download,
   Eye,
   Send,
-  AlertCircle,
   XCircle,
-  ChevronRight,
   TrendingUp,
   Layers,
   Crown,
-  User as UserIcon,
-  LogOut,
-  Sparkles,
-  ExternalLink,
   ShieldCheck,
   Check,
   X,
   Building,
-  ArrowUpRight,
   RefreshCw,
-  Target,
+  Info,
 } from 'lucide-react';
 
 interface PersonalDashboardViewProps {
@@ -41,13 +29,19 @@ interface PersonalDashboardViewProps {
   kras: KRA[];
   kpis: KPI[];
   currentPeriod: PerformancePeriod;
+  periods?: PerformancePeriod[];
   /** Approvals write KPI actuals, so department scores must be refreshed afterwards */
   onSubmissionsChanged: () => Promise<void> | void;
+  /** Reports how many deliverables are waiting for this user's decision (sidebar badge) */
+  onPendingCountChange?: (count: number) => void;
   notify: (message: string, type?: 'success' | 'error') => void;
 }
 
 // Vercel functions accept request bodies up to 4.5 MB; base64 adds ~33%, so files are capped at 3 MB
 const MAX_UPLOAD_BYTES = 3 * 1024 * 1024;
+
+const RESTRICTED_MESSAGE =
+  'Access restricted: evidence files are confidential to the submitter, their reporting manager, the Head of Department and auditors.';
 
 export const PersonalDashboardView: React.FC<PersonalDashboardViewProps> = ({
   currentUser,
@@ -55,13 +49,22 @@ export const PersonalDashboardView: React.FC<PersonalDashboardViewProps> = ({
   kras,
   kpis,
   currentPeriod,
+  periods = [],
   onSubmissionsChanged,
+  onPendingCountChange,
   notify,
 }) => {
+  const isSuperAdmin = currentUser.role === 'SUPER_ADMIN';
+  const isLevel1 = currentUser.level === 1 && !isSuperAdmin;
+  const isLevel2 = currentUser.level === 2;
+  /** May see and decide on other people's deliverables */
+  const isApprover = isSuperAdmin || isLevel1 || isLevel2;
+  /** Sees every deliverable in the department (not only direct reports) */
+  const seesWholeDepartment = isSuperAdmin || isLevel1;
+
+  // All submissions this user may see, across every period (approval queues must not hide older periods)
   const [submissions, setSubmissions] = useState<KPISubmission[]>([]);
   const [hierarchyRollup, setHierarchyRollup] = useState<any>(null);
-  const [reportingChain, setReportingChain] = useState<any[]>([]);
-  const [activeSubTab, setActiveSubTab] = useState<'MY_SUBMISSIONS' | 'ROLLUP_DESK'>('MY_SUBMISSIONS');
   const [isLoading, setIsLoading] = useState<boolean>(true);
   const [isSubmitModalOpen, setIsSubmitModalOpen] = useState<boolean>(false);
   const [inspectingDoc, setInspectingDoc] = useState<KPISubmission | null>(null);
@@ -83,13 +86,12 @@ export const PersonalDashboardView: React.FC<PersonalDashboardViewProps> = ({
   const [rejectRemarks, setRejectRemarks] = useState<string>('');
   const [isRejectMode, setIsRejectMode] = useState<boolean>(false);
   const [isProcessingApproval, setIsProcessingApproval] = useState<boolean>(false);
-  const isLevel1 = currentUser.level === 1;
-  const isLevel2 = currentUser.level === 2;
 
   const activeDepartment = currentUser.department || 'Legal';
   const headOfDepartment = allUsers.find((u) => u.level === 1 && u.role === 'LEGAL_HEAD');
   const reportingManager = currentUser.managerId ? allUsers.find((u) => u.id === currentUser.managerId) : undefined;
-  const canSubmitWork = Boolean(reportingManager) && currentPeriod.status !== 'LOCKED';
+  const canSubmitWork = !isSuperAdmin && Boolean(reportingManager) && currentPeriod.status !== 'LOCKED';
+  const periodName = (id: string) => periods.find((p) => p.id === id)?.name || id;
 
   const departmentKras = kras.filter((k) => k.active);
 
@@ -103,28 +105,33 @@ export const PersonalDashboardView: React.FC<PersonalDashboardViewProps> = ({
         (isLevel2 && ((k.wing && k.wing === currentUser.wing) || (k.department && k.department === currentUser.department))))
   );
 
-  // Load Submissions, Hierarchy Rollup, and Upward Reporting Chain
-  const loadData = async () => {
-    setIsLoading(true);
-    try {
-      const [allSubs, rollup, chain] = await Promise.all([
-        api.getSubmissions({ periodId: currentPeriod.id }),
-        api.getHierarchyRollup(currentPeriod.id),
-        api.getReportingChain(currentPeriod.id),
-      ]);
-      setSubmissions(allSubs);
-      setHierarchyRollup(rollup);
-      setReportingChain(chain || []);
-    } catch (err: any) {
-      notify(err?.message || 'Failed to load your dashboard data', 'error');
-    } finally {
-      setIsLoading(false);
-    }
-  };
+  const loadData = useCallback(
+    async (showSpinner = true) => {
+      if (showSpinner) setIsLoading(true);
+      try {
+        const [allSubs, rollup] = await Promise.all([api.getSubmissions(), api.getHierarchyRollup(currentPeriod.id)]);
+        setSubmissions(allSubs);
+        setHierarchyRollup(rollup);
+      } catch (err: any) {
+        notify(err?.message || 'Failed to load your dashboard data', 'error');
+      } finally {
+        setIsLoading(false);
+      }
+    },
+    [currentPeriod.id, notify]
+  );
 
   useEffect(() => {
     loadData();
-  }, [currentUser.id, currentPeriod.id]);
+  }, [currentUser.id, loadData]);
+
+  // Keep queues current while the page is open (new submissions from the team appear without a reload)
+  useEffect(() => {
+    const timer = setInterval(() => {
+      if (document.visibilityState === 'visible') loadData(false);
+    }, 30_000);
+    return () => clearInterval(timer);
+  }, [loadData]);
 
   const openSubmitModal = () => {
     setSelectedKpiId('');
@@ -137,7 +144,6 @@ export const PersonalDashboardView: React.FC<PersonalDashboardViewProps> = ({
     setIsSubmitModalOpen(true);
   };
 
-  // Handle File Input Selection
   const handleFileChange = (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
     setFileBase64('');
@@ -158,7 +164,6 @@ export const PersonalDashboardView: React.FC<PersonalDashboardViewProps> = ({
     reader.readAsDataURL(file);
   };
 
-  // Submit Work & Upload Document (Real file upload strictly enforced)
   const handleSubmitWork = async (e: React.FormEvent) => {
     e.preventDefault();
     setSubmitError('');
@@ -200,7 +205,7 @@ export const PersonalDashboardView: React.FC<PersonalDashboardViewProps> = ({
 
       setIsSubmitModalOpen(false);
       notify(`Deliverable submitted to ${reportingManager?.name || 'your manager'} for approval`);
-      await loadData();
+      await loadData(false);
     } catch (err: any) {
       setSubmitError(err.message || 'Submission failed');
     } finally {
@@ -208,7 +213,24 @@ export const PersonalDashboardView: React.FC<PersonalDashboardViewProps> = ({
     }
   };
 
-  // Manager Approve Action
+  const openApprove = (sub: KPISubmission) => {
+    setApprovalError('');
+    setApprovalModalSub(sub);
+    setIsRejectMode(false);
+    setApprovalRemarks(
+      sub.isManagerRollup
+        ? `Executive authorization approved by ${currentUser.name} (${currentUser.designation}).`
+        : `Verified and approved by ${currentUser.name}. Points awarded.`
+    );
+  };
+
+  const openReject = (sub: KPISubmission) => {
+    setApprovalError('');
+    setRejectRemarks('');
+    setApprovalModalSub(sub);
+    setIsRejectMode(true);
+  };
+
   const handleApprove = async () => {
     if (!approvalModalSub) return;
     setIsProcessingApproval(true);
@@ -221,7 +243,7 @@ export const PersonalDashboardView: React.FC<PersonalDashboardViewProps> = ({
       notify(`Approved ${approvalModalSub.employeeName}'s ${approvalModalSub.kpiCode} deliverable`);
       setApprovalModalSub(null);
       setApprovalRemarks('');
-      await loadData();
+      await loadData(false);
       await onSubmissionsChanged();
     } catch (err: any) {
       setApprovalError(err.message || 'Approval failed');
@@ -230,7 +252,6 @@ export const PersonalDashboardView: React.FC<PersonalDashboardViewProps> = ({
     }
   };
 
-  // Manager Reject Action
   const handleReject = async () => {
     if (!approvalModalSub || !rejectRemarks.trim()) {
       setApprovalError('Please provide rejection or revision comments');
@@ -244,7 +265,7 @@ export const PersonalDashboardView: React.FC<PersonalDashboardViewProps> = ({
       setApprovalModalSub(null);
       setRejectRemarks('');
       setIsRejectMode(false);
-      await loadData();
+      await loadData(false);
     } catch (err: any) {
       setApprovalError(err.message || 'Rejection failed');
     } finally {
@@ -252,59 +273,216 @@ export const PersonalDashboardView: React.FC<PersonalDashboardViewProps> = ({
     }
   };
 
-  // Document files are only delivered by the server to the submitter, their manager, the HOD and auditors
-  const restrictedMessage =
-    'Access restricted: evidence files are confidential to the submitter, their reporting manager, the Head of Department and auditors.';
-
   const handleViewDoc = (sub: KPISubmission) => {
-    if (sub.document?.isRestricted || !sub.document?.fileData) {
-      notify(restrictedMessage, 'error');
+    if (sub.document?.isRestricted) {
+      notify(RESTRICTED_MESSAGE, 'error');
       return;
     }
     setInspectingDoc(sub);
   };
 
-  const handleDownloadDoc = (sub: KPISubmission) => {
-    if (sub.document?.isRestricted || !sub.document?.fileData) {
-      notify(restrictedMessage, 'error');
+  const handleDownloadDoc = async (sub: KPISubmission) => {
+    if (sub.document?.isRestricted) {
+      notify(RESTRICTED_MESSAGE, 'error');
       return;
     }
-    downloadDocument(sub);
+    try {
+      const doc = sub.document?.hasFile ? await api.getSubmissionDocument(sub.id) : null;
+      if (doc?.fileData) downloadDataUrl(doc.fileData, doc.fileName || sub.document.fileName);
+      else downloadSummary(sub);
+    } catch (err: any) {
+      notify(err?.message || 'Could not download the document', 'error');
+    }
   };
 
-  // Filter submissions for this user
-  const mySubmissions = submissions.filter((s) => s.employeeId === currentUser.id);
+  // ---------- Derived lists ----------
+  const periodSubmissions = submissions.filter((s) => s.periodId === currentPeriod.id);
+  const mySubmissions = periodSubmissions.filter((s) => s.employeeId === currentUser.id);
 
-  // Filter subordinate submissions waiting for this manager's review (strictly direct reports)
-  const pendingForMe = submissions.filter(
-    (s) =>
-      (s.managerId === currentUser.id || isLevel1) &&
-      s.status === 'PENDING_APPROVAL' &&
-      s.employeeId !== currentUser.id
-  );
+  const decidesOn = (s: KPISubmission) => s.employeeId !== currentUser.id && (s.managerId === currentUser.id || seesWholeDepartment);
 
-  const approvedForMe = submissions.filter(
-    (s) =>
-      (s.managerId === currentUser.id || isLevel1) &&
-      s.status === 'APPROVED' &&
-      s.employeeId !== currentUser.id
-  );
+  // Everything waiting for this user's decision, from ANY period, oldest first
+  const pendingForMe = submissions
+    .filter((s) => s.status === 'PENDING_APPROVAL' && decidesOn(s))
+    .sort((a, b) => a.submittedDate.localeCompare(b.submittedDate));
 
-  // Total points earned by current user
+  const decidedByTeam = submissions
+    .filter((s) => s.status !== 'PENDING_APPROVAL' && decidesOn(s))
+    .sort((a, b) => (b.approvedDate || '').localeCompare(a.approvedDate || ''));
+  const approvedForMe = decidedByTeam.filter((s) => s.status === 'APPROVED');
+
+  useEffect(() => {
+    onPendingCountChange?.(pendingForMe.length);
+  }, [pendingForMe.length, onPendingCountChange]);
+
   const myEarnedPoints = mySubmissions.reduce((acc, s) => acc + s.pointsAwarded, 0);
   const myApprovedCount = mySubmissions.filter((s) => s.status === 'APPROVED').length;
   const myPendingCount = mySubmissions.filter((s) => s.status === 'PENDING_APPROVAL').length;
 
-  // Role Badge Styling
-  const levelBadge = isLevel1
+  const levelBadge = isSuperAdmin
+    ? { label: 'Super Admin', bg: 'bg-rose-500/20 text-rose-200 border-rose-400/30' }
+    : isLevel1
     ? { label: 'Head of Department', bg: 'bg-amber-500/20 text-amber-300 border-amber-500/30' }
     : isLevel2
     ? { label: 'Wing Manager', bg: 'bg-indigo-500/20 text-indigo-300 border-indigo-500/30' }
     : { label: 'Technical Staff', bg: 'bg-emerald-500/20 text-emerald-300 border-emerald-500/30' };
 
+  const allStaffNodes: any[] = [
+    ...(hierarchyRollup?.directStaff || []),
+    ...(hierarchyRollup?.managers || []).flatMap((m: any) => m.subordinates || []),
+  ];
+  const myRollupPercent = isLevel1 || isSuperAdmin
+    ? hierarchyRollup?.head?.departmentRollupScore ?? 0
+    : isLevel2
+    ? hierarchyRollup?.managers?.find((m: any) => m.id === currentUser.id)?.rollupScore ?? 0
+    : allStaffNodes.find((s: any) => s.id === currentUser.id)?.completionRate ?? 0;
+
+  // ---------- Reusable pieces ----------
+  const statusChip = (sub: KPISubmission) =>
+    sub.status === 'APPROVED' ? (
+      <span className="text-[10px] font-bold px-2 py-0.5 rounded-full bg-emerald-100 text-emerald-800 flex items-center gap-1">
+        <CheckCircle2 className="w-3 h-3 text-emerald-600" />
+        Approved • {sub.pointsAwarded} Pts
+      </span>
+    ) : sub.status === 'REJECTED' ? (
+      <span className="text-[10px] font-bold px-2 py-0.5 rounded-full bg-rose-100 text-rose-800 flex items-center gap-1">
+        <XCircle className="w-3 h-3 text-rose-600" />
+        Revision Requested
+      </span>
+    ) : (
+      <span className="text-[10px] font-bold px-2 py-0.5 rounded-full bg-amber-100 text-amber-800 flex items-center gap-1">
+        <Clock className="w-3 h-3 text-amber-600" />
+        Pending Approval
+      </span>
+    );
+
+  const documentCard = (sub: KPISubmission) => (
+    <div className="bg-slate-50 p-2.5 rounded-xl border border-slate-200 flex items-center justify-between text-xs">
+      <div className="flex items-center gap-2 truncate">
+        <FileText className="w-4 h-4 text-indigo-600 shrink-0" />
+        <div className="truncate">
+          <span className="font-semibold text-slate-800 block truncate">{sub.document.fileName}</span>
+          <span className="text-[10px] text-slate-400">
+            {sub.document.fileSize} • {sub.document.fileType}
+            {!sub.document.hasFile && ' • no stored file'}
+          </span>
+        </div>
+      </div>
+      <div className="flex items-center gap-1.5 shrink-0 ml-2">
+        <button
+          onClick={() => handleViewDoc(sub)}
+          className="px-2 py-1 hover:bg-slate-200 text-slate-700 rounded-lg flex items-center gap-1 text-[11px] font-semibold"
+          title="Preview document"
+        >
+          <Eye className="w-3.5 h-3.5" /> View
+        </button>
+        <button
+          onClick={() => handleDownloadDoc(sub)}
+          className="p-1 hover:bg-slate-200 text-indigo-600 rounded"
+          title="Download document"
+          aria-label="Download document"
+        >
+          <Download className="w-3.5 h-3.5" />
+        </button>
+      </div>
+    </div>
+  );
+
+  const renderQueueItem = (sub: KPISubmission) => (
+    <div key={sub.id} className="p-4 hover:bg-indigo-50/30 transition-all space-y-3">
+      <div className="flex items-start justify-between gap-2">
+        <div>
+          <div className="font-bold text-slate-900 text-xs">{sub.employeeName}</div>
+          <div className="text-[10px] text-slate-500">
+            {sub.employeeDesignation} • Submitted {sub.submittedDate} • {periodName(sub.periodId)}
+          </div>
+          {seesWholeDepartment && sub.managerId !== currentUser.id && (
+            <div className="text-[10px] text-slate-400">Routed to: {sub.managerName}</div>
+          )}
+        </div>
+        <div className="flex flex-col items-end gap-1">
+          <span className="text-[10px] font-bold px-2 py-0.5 rounded bg-indigo-50 text-indigo-700 border border-indigo-200 font-mono">
+            {sub.kpiCode}
+          </span>
+          {sub.isManagerRollup && (
+            <span className="text-[10px] font-bold px-2 py-0.5 rounded-full bg-amber-100 text-amber-800 flex items-center gap-1">
+              <Crown className="w-3 h-3" /> Wing rollup
+            </span>
+          )}
+        </div>
+      </div>
+
+      <div className="text-xs text-slate-700 font-medium">{sub.kpiName}</div>
+      <div className="text-[11px] text-slate-500">
+        Achieved <strong className="text-slate-800">{sub.achievedValue}</strong> / target {sub.targetValue} {sub.unit}
+      </div>
+      {sub.notes && <p className="text-[11px] text-slate-600 bg-white p-2 rounded-lg border border-slate-100">{sub.notes}</p>}
+
+      {documentCard(sub)}
+
+      <div className="flex items-center justify-end gap-2 pt-1">
+        <button
+          onClick={() => openReject(sub)}
+          className="px-3 py-1.5 bg-rose-50 hover:bg-rose-100 text-rose-700 border border-rose-200 rounded-lg text-xs font-semibold transition-all"
+        >
+          Request Revision
+        </button>
+        <button
+          onClick={() => openApprove(sub)}
+          className="px-3.5 py-1.5 bg-emerald-600 hover:bg-emerald-700 active:scale-95 text-white rounded-lg text-xs font-bold shadow-xs transition-all flex items-center gap-1"
+        >
+          <Check className="w-3.5 h-3.5" />
+          <span>{sub.isManagerRollup ? 'Executive Sign-off' : 'Approve & Award Points'}</span>
+        </button>
+      </div>
+    </div>
+  );
+
+  const approvalQueuePanel = (
+    <div className="bg-white rounded-2xl border border-slate-200 shadow-xs overflow-hidden">
+      <div className="p-4 bg-gradient-to-r from-indigo-900 to-slate-900 text-white flex items-center justify-between">
+        <div>
+          <h3 className="text-sm font-bold flex items-center gap-2">
+            <ShieldCheck className="w-4 h-4 text-emerald-400" />
+            <span>Approvals Required</span>
+          </h3>
+          <p className="text-[11px] text-indigo-200 mt-0.5">
+            {seesWholeDepartment
+              ? 'Every deliverable in the department waiting for a decision (all periods)'
+              : 'Deliverables your direct reports submitted to you (all periods)'}
+          </p>
+        </div>
+        <span className="text-[10px] font-bold px-2 py-0.5 rounded-full bg-amber-400 text-slate-900">{pendingForMe.length} Pending</span>
+      </div>
+
+      <div className="divide-y divide-slate-100 max-h-[520px] overflow-y-auto">
+        {pendingForMe.length === 0 ? (
+          <div className="p-6 text-center text-slate-400 text-xs">
+            <CheckCircle2 className="w-6 h-6 text-emerald-500 mx-auto mb-1.5" />
+            <p className="font-semibold text-slate-700">Nothing waiting for your approval</p>
+            <p className="text-[11px] text-slate-400 mt-0.5">New submissions appear here automatically.</p>
+          </div>
+        ) : (
+          pendingForMe.map(renderQueueItem)
+        )}
+      </div>
+    </div>
+  );
+
+  const progressBar = (percent: number, tone: 'emerald' | 'indigo' | 'amber' = 'emerald') => (
+    <div className="w-full bg-slate-200 h-1.5 rounded-full overflow-hidden">
+      <div
+        className={`h-full rounded-full transition-all duration-500 ${
+          tone === 'indigo' ? 'bg-indigo-500' : tone === 'amber' ? 'bg-amber-500' : 'bg-emerald-500'
+        }`}
+        style={{ width: `${Math.max(0, Math.min(100, percent))}%` }}
+      />
+    </div>
+  );
+
   return (
     <div className="p-4 sm:p-6 lg:p-8 space-y-6 max-w-7xl mx-auto">
-      {/* Personalized Executive Hero Banner */}
+      {/* Personalized Hero Banner */}
       <div className="bg-gradient-to-r from-slate-900 via-slate-900 to-indigo-950 text-white rounded-2xl p-6 border border-slate-800 shadow-xl flex flex-col md:flex-row md:items-center justify-between gap-6 relative overflow-hidden">
         <div className="absolute right-0 top-0 w-96 h-96 bg-brand-gradient/10 rounded-full blur-3xl pointer-events-none" />
 
@@ -321,9 +499,7 @@ export const PersonalDashboardView: React.FC<PersonalDashboardViewProps> = ({
           <div>
             <div className="flex flex-wrap items-center gap-2">
               <h2 className="text-xl sm:text-2xl font-bold tracking-tight text-white">{currentUser.name}</h2>
-              <span className={`text-[11px] font-bold px-2.5 py-0.5 rounded-full border ${levelBadge.bg}`}>
-                {levelBadge.label}
-              </span>
+              <span className={`text-[11px] font-bold px-2.5 py-0.5 rounded-full border ${levelBadge.bg}`}>{levelBadge.label}</span>
             </div>
             <p className="text-xs text-indigo-300 font-medium mt-1">
               {currentUser.designation} • {currentUser.department}
@@ -333,51 +509,71 @@ export const PersonalDashboardView: React.FC<PersonalDashboardViewProps> = ({
             </div>
           </div>
         </div>
+
+        <button
+          onClick={() => loadData(false)}
+          className="relative z-10 self-start md:self-center px-3 py-2 rounded-xl bg-white/10 hover:bg-white/20 text-xs font-semibold flex items-center gap-1.5"
+          title="Reload submissions and approvals"
+        >
+          <RefreshCw className={`w-3.5 h-3.5 ${isLoading ? 'animate-spin' : ''}`} />
+          Refresh
+        </button>
       </div>
 
-      {/* KPI & KRA Hierarchy Status Overview Cards */}
+      {isSuperAdmin && (
+        <div className="p-4 rounded-2xl border border-rose-200 bg-rose-50 text-xs text-rose-900 flex items-start gap-2">
+          <Info className="w-4 h-4 shrink-0 mt-0.5" />
+          <span>
+            <strong>Super Admin account.</strong> You govern the whole system and can approve any pending deliverable, but you do
+            not have personal KRAs or KPIs and do not submit deliverables yourself.
+          </span>
+        </div>
+      )}
+
+      {/* Overview Cards */}
       <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4">
-        {/* Points Card */}
-        <div className="bg-white rounded-2xl p-5 border border-slate-200 shadow-xs flex items-center justify-between">
-          <div>
-            <div className="text-[11px] font-bold text-slate-400 uppercase tracking-wider">My Points Awarded</div>
-            <div className="text-2xl font-black text-slate-900 mt-1 flex items-baseline gap-1">
-              <span>{myEarnedPoints}</span>
-              <span className="text-xs font-normal text-slate-500">pts</span>
-            </div>
-            <div className="text-[11px] text-emerald-600 font-semibold mt-1 flex items-center gap-1">
-              <CheckCircle2 className="w-3 h-3" />
-              <span>{myApprovedCount} Deliverables Approved</span>
-            </div>
-          </div>
-          <div className="w-12 h-12 rounded-2xl bg-emerald-50 text-emerald-600 flex items-center justify-center shrink-0">
-            <Award className="w-6 h-6" />
-          </div>
-        </div>
-
-        {/* Submissions Pending Card */}
-        <div className="bg-white rounded-2xl p-5 border border-slate-200 shadow-xs flex items-center justify-between">
-          <div>
-            <div className="text-[11px] font-bold text-slate-400 uppercase tracking-wider">My Pending Submissions</div>
-            <div className="text-2xl font-black text-slate-900 mt-1">{myPendingCount}</div>
-            <div className="text-[11px] text-amber-600 font-semibold mt-1 flex items-center gap-1">
-              <Clock className="w-3 h-3" />
-              <span>Awaiting Upper Manager Review</span>
-            </div>
-          </div>
-          <div className="w-12 h-12 rounded-2xl bg-amber-50 text-amber-600 flex items-center justify-center shrink-0">
-            <FileText className="w-6 h-6" />
-          </div>
-        </div>
-
-        {/* Subordinate Review Queue (For Managers & HOD) */}
-        {(isLevel1 || isLevel2) && (
+        {!isSuperAdmin && (
           <div className="bg-white rounded-2xl p-5 border border-slate-200 shadow-xs flex items-center justify-between">
             <div>
-              <div className="text-[11px] font-bold text-slate-400 uppercase tracking-wider">Subordinate Approval Queue</div>
+              <div className="text-[11px] font-bold text-slate-400 uppercase tracking-wider">My Points Awarded</div>
+              <div className="text-2xl font-black text-slate-900 mt-1 flex items-baseline gap-1">
+                <span>{myEarnedPoints}</span>
+                <span className="text-xs font-normal text-slate-500">pts</span>
+              </div>
+              <div className="text-[11px] text-emerald-600 font-semibold mt-1 flex items-center gap-1">
+                <CheckCircle2 className="w-3 h-3" />
+                <span>{myApprovedCount} Deliverables Approved</span>
+              </div>
+            </div>
+            <div className="w-12 h-12 rounded-2xl bg-emerald-50 text-emerald-600 flex items-center justify-center shrink-0">
+              <Award className="w-6 h-6" />
+            </div>
+          </div>
+        )}
+
+        {!isSuperAdmin && (
+          <div className="bg-white rounded-2xl p-5 border border-slate-200 shadow-xs flex items-center justify-between">
+            <div>
+              <div className="text-[11px] font-bold text-slate-400 uppercase tracking-wider">My Pending Submissions</div>
+              <div className="text-2xl font-black text-slate-900 mt-1">{myPendingCount}</div>
+              <div className="text-[11px] text-amber-600 font-semibold mt-1 flex items-center gap-1">
+                <Clock className="w-3 h-3" />
+                <span>Awaiting {reportingManager?.name || 'manager'} review</span>
+              </div>
+            </div>
+            <div className="w-12 h-12 rounded-2xl bg-amber-50 text-amber-600 flex items-center justify-center shrink-0">
+              <FileText className="w-6 h-6" />
+            </div>
+          </div>
+        )}
+
+        {isApprover && (
+          <div className="bg-white rounded-2xl p-5 border border-slate-200 shadow-xs flex items-center justify-between">
+            <div>
+              <div className="text-[11px] font-bold text-slate-400 uppercase tracking-wider">Approvals Required</div>
               <div className="text-2xl font-black text-indigo-600 mt-1">{pendingForMe.length}</div>
               <div className="text-[11px] text-slate-500 mt-1">
-                {pendingForMe.length > 0 ? 'Requires Your Verification' : 'All Deliverables Cleared'}
+                {pendingForMe.length > 0 ? 'Requires your verification' : 'All deliverables cleared'}
               </div>
             </div>
             <div className="w-12 h-12 rounded-2xl bg-indigo-50 text-indigo-600 flex items-center justify-center shrink-0">
@@ -386,26 +582,26 @@ export const PersonalDashboardView: React.FC<PersonalDashboardViewProps> = ({
           </div>
         )}
 
-        {/* Hierarchy Rollup Status */}
+        {isSuperAdmin && (
+          <div className="bg-white rounded-2xl p-5 border border-slate-200 shadow-xs flex items-center justify-between">
+            <div>
+              <div className="text-[11px] font-bold text-slate-400 uppercase tracking-wider">Decided Deliverables</div>
+              <div className="text-2xl font-black text-slate-900 mt-1">{decidedByTeam.length}</div>
+              <div className="text-[11px] text-emerald-600 font-semibold mt-1">{approvedForMe.length} approved</div>
+            </div>
+            <div className="w-12 h-12 rounded-2xl bg-emerald-50 text-emerald-600 flex items-center justify-center shrink-0">
+              <CheckCircle2 className="w-6 h-6" />
+            </div>
+          </div>
+        )}
+
         <div className="bg-white rounded-2xl p-5 border border-slate-200 shadow-xs flex items-center justify-between">
           <div>
-            <div className="text-[11px] font-bold text-slate-400 uppercase tracking-wider">Hierarchy Rollup Impact</div>
-            <div className="text-2xl font-black text-slate-900 mt-1">
-              {isLoading
-                ? '…'
-                : isLevel1
-                ? `${hierarchyRollup?.head?.departmentRollupScore ?? 0}%`
-                : isLevel2
-                ? `${hierarchyRollup?.managers?.find((m: any) => m.id === currentUser.id)?.rollupScore ?? 0}%`
-                : `${
-                    [...(hierarchyRollup?.directStaff || []), ...(hierarchyRollup?.managers || []).flatMap((m: any) => m.subordinates)].find(
-                      (s: any) => s.id === currentUser.id
-                    )?.completionRate ?? 0
-                  }%`}
-            </div>
+            <div className="text-[11px] font-bold text-slate-400 uppercase tracking-wider">Hierarchy Rollup</div>
+            <div className="text-2xl font-black text-slate-900 mt-1">{isLoading ? '…' : `${myRollupPercent}%`}</div>
             <div className="text-[11px] text-indigo-600 font-semibold mt-1 flex items-center gap-1">
               <TrendingUp className="w-3 h-3" />
-              <span>{isLevel1 ? 'Team deliverables approved this period' : 'Your deliverables approved this period'}</span>
+              <span>{seesWholeDepartment || isLevel2 ? 'Team deliverables approved' : 'Your deliverables approved'} • {currentPeriod.name}</span>
             </div>
           </div>
           <div className="w-12 h-12 rounded-2xl bg-indigo-50 text-indigo-600 flex items-center justify-center shrink-0">
@@ -414,34 +610,29 @@ export const PersonalDashboardView: React.FC<PersonalDashboardViewProps> = ({
         </div>
       </div>
 
-      {/* Department-Wise KRAs & Org Chart Hierarchy Rollup */}
+      {/* Department-Wise KRAs */}
       <div className="bg-white rounded-2xl p-6 border border-slate-200 shadow-xs space-y-5">
         <div className="flex flex-col md:flex-row md:items-center justify-between gap-4 border-b border-slate-100 pb-4">
           <div>
             <div className="flex flex-wrap items-center gap-2.5">
               <Building className="w-5 h-5 text-indigo-600 shrink-0" />
-              <h3 className="text-base font-bold text-slate-900">
-                Department-Wise KRAs: {activeDepartment}
-              </h3>
-              {currentUser.wing && (
+              <h3 className="text-base font-bold text-slate-900">Department-Wise KRAs: {isSuperAdmin ? 'All Departments' : activeDepartment}</h3>
+              {currentUser.wing && !isSuperAdmin && (
                 <span className="text-[11px] font-bold px-2.5 py-0.5 rounded-full bg-indigo-50 text-indigo-700 border border-indigo-200">
                   {currentUser.wing} Wing
                 </span>
               )}
             </div>
             <p className="text-xs text-slate-500 mt-1">
-              KRAs and KPIs are architected hierarchically: when lower employees complete deliverables and their manager approves, their KRA completes and automatically rolls up to fulfill upper executive KRAs.
+              Completion shows the share of deliverables submitted against each KRA in {currentPeriod.name} that have been approved.
             </p>
           </div>
         </div>
 
-        {/* Department KRA Cards */}
         <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
           {departmentKras.map((kra) => {
             const kpiItems = kpis.filter((k) => k.kraId === kra.id);
-            const kraSubmissions = submissions.filter(
-              (s) => s.kraId === kra.id && s.periodId === currentPeriod.id
-            );
+            const kraSubmissions = periodSubmissions.filter((s) => s.kraId === kra.id);
             const approvedSubs = kraSubmissions.filter((s) => s.status === 'APPROVED');
             const completionPercent =
               kraSubmissions.length > 0 ? Math.min(100, Math.round((approvedSubs.length / kraSubmissions.length) * 100)) : 0;
@@ -453,27 +644,15 @@ export const PersonalDashboardView: React.FC<PersonalDashboardViewProps> = ({
               >
                 <div className="space-y-2">
                   <div className="flex items-center justify-between gap-2">
-                    <span className="text-[10px] font-black px-2 py-0.5 rounded bg-indigo-100 text-indigo-800 font-mono">
-                      KRA #{kra.kraNumber}
-                    </span>
-                    <span className="text-[11px] font-extrabold text-indigo-600">
-                      Weight: {kra.weight}%
-                    </span>
+                    <span className="text-[10px] font-black px-2 py-0.5 rounded bg-indigo-100 text-indigo-800 font-mono">KRA #{kra.kraNumber}</span>
+                    <span className="text-[11px] font-extrabold text-indigo-600">Weight: {kra.weight}%</span>
                   </div>
-
-                  <h4 className="text-xs font-bold text-slate-900 leading-snug">
-                    {kra.name}
-                  </h4>
-                  <p className="text-[11px] text-slate-500 line-clamp-2 leading-relaxed">
-                    {kra.description}
-                  </p>
-
+                  <h4 className="text-xs font-bold text-slate-900 leading-snug">{kra.name}</h4>
+                  <p className="text-[11px] text-slate-500 line-clamp-2 leading-relaxed">{kra.description}</p>
                   <div className="text-[11px] text-slate-600 flex items-center justify-between pt-1 border-t border-slate-200/60">
                     <span className="text-slate-400">Department Lead:</span>
                     <span className="font-semibold text-slate-800">{kra.ownerName}</span>
                   </div>
-
-                  {/* Child KPIs */}
                   <div className="space-y-1.5 pt-1">
                     <span className="text-[10px] font-bold text-slate-400 uppercase tracking-wider block">
                       Assigned Deliverables ({kpiItems.length})
@@ -485,23 +664,15 @@ export const PersonalDashboardView: React.FC<PersonalDashboardViewProps> = ({
                           className="text-[11px] bg-white px-2 py-1.5 rounded-lg border border-slate-200/80 flex items-center justify-between gap-2"
                         >
                           <div className="truncate flex items-center gap-1.5">
-                            <span className="font-mono text-[10px] font-bold text-indigo-600 shrink-0">
-                              {kpi.kpiCode}
-                            </span>
-                            <span className="truncate text-slate-700 font-medium">
-                              {kpi.name}
-                            </span>
+                            <span className="font-mono text-[10px] font-bold text-indigo-600 shrink-0">{kpi.kpiCode}</span>
+                            <span className="truncate text-slate-700 font-medium">{kpi.name}</span>
                           </div>
-                          <span className="text-[10px] text-slate-500 shrink-0 font-semibold">
-                            {kpi.ownerName.split(' ')[0]}
-                          </span>
+                          <span className="text-[10px] text-slate-500 shrink-0 font-semibold">{(kpi.ownerName || '').split(' ')[0]}</span>
                         </div>
                       ))}
                     </div>
                   </div>
                 </div>
-
-                {/* Live Hierarchy Completion Progress */}
                 <div className="pt-2 border-t border-slate-200/80">
                   <div className="flex items-center justify-between text-[11px] mb-1">
                     <span className="text-slate-500 font-medium">
@@ -511,12 +682,7 @@ export const PersonalDashboardView: React.FC<PersonalDashboardViewProps> = ({
                     </span>
                     <span className="font-black text-emerald-600">{completionPercent}%</span>
                   </div>
-                  <div className="w-full bg-slate-200 h-1.5 rounded-full overflow-hidden">
-                    <div
-                      className="bg-emerald-500 h-full rounded-full transition-all duration-500"
-                      style={{ width: `${completionPercent}%` }}
-                    />
-                  </div>
+                  {progressBar(completionPercent)}
                 </div>
               </div>
             );
@@ -524,53 +690,10 @@ export const PersonalDashboardView: React.FC<PersonalDashboardViewProps> = ({
         </div>
       </div>
 
-      {/* View Switcher Tabs: Submissions | Upward Visibility | Hierarchy Rollup */}
-      <div className="flex flex-wrap items-center justify-between gap-3 border-b border-slate-200 pb-3">
-        <div className="flex flex-wrap items-center gap-2">
-          <button
-            onClick={() => setActiveSubTab('MY_SUBMISSIONS')}
-            className={`px-4 py-2 rounded-xl text-xs font-bold transition-all flex items-center gap-2 ${
-              activeSubTab === 'MY_SUBMISSIONS'
-                ? 'bg-slate-900 text-white shadow-sm'
-                : 'bg-white text-slate-600 hover:bg-slate-100 border border-slate-200'
-            }`}
-          >
-            <FileText className="w-3.5 h-3.5" />
-            <span>My Deliverables & Submissions</span>
-            {myPendingCount > 0 && (
-              <span className="text-[10px] bg-amber-500 text-slate-900 font-bold px-1.5 py-0.2 rounded-full">
-                {myPendingCount}
-              </span>
-            )}
-          </button>
-
-
-
-          <button
-            onClick={() => setActiveSubTab('ROLLUP_DESK')}
-            className={`px-4 py-2 rounded-xl text-xs font-bold transition-all flex items-center gap-2 ${
-              activeSubTab === 'ROLLUP_DESK'
-                ? 'bg-slate-900 text-white shadow-sm'
-                : 'bg-white text-slate-600 hover:bg-slate-100 border border-slate-200'
-            }`}
-          >
-            <Layers className="w-3.5 h-3.5 text-emerald-400" />
-            <span>Hierarchy Rollup & Approvals Desk</span>
-            {pendingForMe.length > 0 && (
-              <span className="text-[10px] bg-rose-500 text-white font-bold px-1.5 py-0.2 rounded-full animate-pulse">
-                {pendingForMe.length}
-              </span>
-            )}
-          </button>
-        </div>
-      </div>
-
-      {/* VIEW 1: MY SUBMISSIONS & DELIVERABLES */}
-      {activeSubTab === 'MY_SUBMISSIONS' && (
+      {/* MY SUBMISSIONS */}
+      {!isSuperAdmin && (
         <div className="grid grid-cols-1 lg:grid-cols-12 gap-6">
-          {/* Left Column: Work Submission & Deliverables */}
-          <div className="lg:col-span-7 space-y-6">
-            {/* Action Header */}
+          <div className={`${isApprover ? 'lg:col-span-7' : 'lg:col-span-12'} space-y-6`}>
             <div className="bg-white rounded-2xl p-5 border border-slate-200 shadow-xs flex flex-col sm:flex-row sm:items-center justify-between gap-4">
               <div>
                 <h3 className="text-base font-bold text-slate-900 flex items-center gap-2">
@@ -578,7 +701,7 @@ export const PersonalDashboardView: React.FC<PersonalDashboardViewProps> = ({
                   <span>My KRA Deliverables & Document Submissions</span>
                 </h3>
                 <p className="text-xs text-slate-500 mt-0.5">
-                  Submit completed tasks with real attached proof documents (PDF, DOC, PNG). Upper managers review and award points.
+                  Submit completed work with a proof document (PDF, DOC, PNG). Your reporting manager reviews it and awards points.
                 </p>
               </div>
               {canSubmitWork ? (
@@ -590,7 +713,7 @@ export const PersonalDashboardView: React.FC<PersonalDashboardViewProps> = ({
                   <span>Submit Work & Upload Doc</span>
                 </button>
               ) : (
-                <span className="text-[11px] text-slate-500 max-w-[220px] text-right">
+                <span className="text-[11px] text-slate-500 max-w-[240px] text-right">
                   {currentPeriod.status === 'LOCKED'
                     ? `${currentPeriod.name} is locked — submissions are closed.`
                     : 'You have no reporting manager to approve deliverables. Record KPI actuals in Reconciliation.'}
@@ -598,214 +721,81 @@ export const PersonalDashboardView: React.FC<PersonalDashboardViewProps> = ({
               )}
             </div>
 
-            {/* Submissions List */}
             <div className="bg-white rounded-2xl border border-slate-200 shadow-xs overflow-hidden">
               <div className="px-5 py-4 border-b border-slate-100 flex items-center justify-between bg-slate-50/50">
-                <span className="text-xs font-bold text-slate-800 uppercase tracking-wider">
-                  Submitted Documents ({mySubmissions.length})
-                </span>
+                <span className="text-xs font-bold text-slate-800 uppercase tracking-wider">Submitted Documents ({mySubmissions.length})</span>
                 <span className="text-[11px] text-slate-500">Period: {currentPeriod.name}</span>
               </div>
 
-              <div className="divide-y divide-slate-100 max-h-[460px] overflow-y-auto">
+              <div className="divide-y divide-slate-100 max-h-[520px] overflow-y-auto">
                 {mySubmissions.length === 0 ? (
                   <div className="p-8 text-center text-slate-400 text-xs">
                     <FileText className="w-8 h-8 text-slate-300 mx-auto mb-2" />
                     <p className="font-semibold text-slate-600">No deliverables submitted yet for this period</p>
-                    <p className="mt-1">Click "Submit Work & Upload Doc" above to upload your required PDF, DOC or PNG document.</p>
+                    {canSubmitWork && <p className="mt-1">Click "Submit Work & Upload Doc" above to send your first deliverable.</p>}
                   </div>
                 ) : (
-                  mySubmissions.map((sub) => {
-                    const isApproved = sub.status === 'APPROVED';
-                    const isRejected = sub.status === 'REJECTED';
-                    return (
-                      <div key={sub.id} className="p-4 sm:p-5 hover:bg-slate-50/80 transition-all flex flex-col sm:flex-row sm:items-center justify-between gap-4">
-                        <div className="space-y-1.5 flex-1 min-w-0">
-                          <div className="flex flex-wrap items-center gap-2">
-                            <span className="font-bold text-slate-900 text-xs truncate">{sub.kpiName}</span>
-                            <span className="text-[10px] font-bold px-2 py-0.5 rounded bg-slate-100 text-slate-600 font-mono">
-                              {sub.kpiCode}
-                            </span>
-                            {isApproved ? (
-                              <span className="text-[10px] font-bold px-2 py-0.5 rounded-full bg-emerald-100 text-emerald-800 flex items-center gap-1">
-                                <CheckCircle2 className="w-3 h-3 text-emerald-600" />
-                                Approved • {sub.pointsAwarded} Pts
-                              </span>
-                            ) : isRejected ? (
-                              <span className="text-[10px] font-bold px-2 py-0.5 rounded-full bg-rose-100 text-rose-800 flex items-center gap-1">
-                                <XCircle className="w-3 h-3 text-rose-600" />
-                                Revision Requested
-                              </span>
-                            ) : (
-                              <span className="text-[10px] font-bold px-2 py-0.5 rounded-full bg-amber-100 text-amber-800 flex items-center gap-1">
-                                <Clock className="w-3 h-3 text-amber-600" />
-                                Pending Review (0 Pts)
-                              </span>
-                            )}
-                          </div>
-
-                          {/* Document Badge */}
-                          <div className="flex flex-wrap items-center gap-2 text-xs">
-                            <div className="inline-flex items-center gap-1.5 bg-slate-100 px-2.5 py-1 rounded-lg border border-slate-200 text-slate-700 font-medium">
-                              <FileText className="w-3.5 h-3.5 text-indigo-600 shrink-0" />
-                              <span className="font-semibold truncate max-w-[200px]">{sub.document.fileName}</span>
-                              <span className="text-[10px] text-slate-400">({sub.document.fileSize})</span>
-                            </div>
-                            <span className="text-[11px] text-slate-400">
-                              Submitted on {sub.submittedDate} • Reporting Manager: {sub.managerName}
-                            </span>
-                          </div>
-
-                          {/* Confidentiality Org Chart Tag */}
-                          <div className="flex items-center gap-1.5 text-[10px] text-slate-600 bg-slate-100 px-2 py-1 rounded-md border border-slate-200 w-fit">
-                            <ShieldCheck className="w-3.5 h-3.5 text-emerald-600 shrink-0" />
-                            <span>Confidential: Strictly private to you & reporting manager ({sub.managerName}) per Org Chart</span>
-                          </div>
-
-                          {sub.notes && (
-                            <p className="text-xs text-slate-600 bg-slate-50 p-2 rounded-lg border border-slate-100">
-                              {sub.notes}
-                            </p>
-                          )}
-
-                          <div className="text-[11px] text-slate-500">
-                            Achieved {sub.achievedValue} / target {sub.targetValue} {sub.unit}
-                          </div>
-
-                          {sub.approvalRemarks && (
-                            <p
-                              className={`text-xs p-2 rounded-lg border font-medium ${
-                                isRejected ? 'text-rose-800 bg-rose-50 border-rose-100' : 'text-emerald-800 bg-emerald-50 border-emerald-100'
-                              }`}
-                            >
-                              Manager Remarks: {sub.approvalRemarks}
-                            </p>
-                          )}
-                        </div>
-
-                        {/* Document Actions */}
-                        <div className="flex items-center gap-2 shrink-0">
-                          <button
-                            onClick={() => handleViewDoc(sub)}
-                            className="px-3 py-1.5 bg-slate-100 hover:bg-slate-200 text-slate-700 rounded-lg text-xs font-semibold flex items-center gap-1.5 transition-all"
-                          >
-                            <Eye className="w-3.5 h-3.5 text-slate-500" />
-                            <span>View Doc</span>
-                          </button>
-                          <button
-                            onClick={() => handleDownloadDoc(sub)}
-                            className="px-3 py-1.5 bg-indigo-50 hover:bg-indigo-100 text-indigo-700 rounded-lg text-xs font-semibold flex items-center gap-1.5 transition-all"
-                          >
-                            <Download className="w-3.5 h-3.5 text-indigo-600" />
-                            <span>Download</span>
-                          </button>
-                        </div>
+                  mySubmissions.map((sub) => (
+                    <div key={sub.id} className="p-4 sm:p-5 hover:bg-slate-50/80 transition-all space-y-2">
+                      <div className="flex flex-wrap items-center gap-2">
+                        <span className="font-bold text-slate-900 text-xs truncate">{sub.kpiName}</span>
+                        <span className="text-[10px] font-bold px-2 py-0.5 rounded bg-slate-100 text-slate-600 font-mono">{sub.kpiCode}</span>
+                        {statusChip(sub)}
                       </div>
-                    );
-                  })
+                      <div className="text-[11px] text-slate-500">
+                        Submitted {sub.submittedDate} to <strong className="text-slate-700">{sub.managerName}</strong> • Achieved{' '}
+                        {sub.achievedValue} / target {sub.targetValue} {sub.unit}
+                      </div>
+                      {documentCard(sub)}
+                      {sub.notes && <p className="text-xs text-slate-600 bg-slate-50 p-2 rounded-lg border border-slate-100">{sub.notes}</p>}
+                      {sub.approvalRemarks && (
+                        <p
+                          className={`text-xs p-2 rounded-lg border font-medium ${
+                            sub.status === 'REJECTED' ? 'text-rose-800 bg-rose-50 border-rose-100' : 'text-emerald-800 bg-emerald-50 border-emerald-100'
+                          }`}
+                        >
+                          {sub.approvedBy ? `${sub.approvedBy}: ` : 'Manager remarks: '}
+                          {sub.approvalRemarks}
+                        </p>
+                      )}
+                    </div>
+                  ))
                 )}
               </div>
             </div>
           </div>
 
-          {/* Right Column: Upper Manager Approval Desk & Hierarchy Visualizer */}
+          {isApprover && <div className="lg:col-span-5 space-y-6">{approvalQueuePanel}</div>}
+        </div>
+      )}
+      {/* Super Admin: no own deliverables, only the department-wide approval queue */}
+      {isSuperAdmin && (
+        <div className="grid grid-cols-1 lg:grid-cols-12 gap-6">
+          <div className="lg:col-span-7 space-y-6">{approvalQueuePanel}</div>
           <div className="lg:col-span-5 space-y-6">
-            {/* Subordinate Approvals Desk (For Managers & GM) */}
-            {(isLevel1 || isLevel2) && (
+            {isApprover && (
               <div className="bg-white rounded-2xl border border-slate-200 shadow-xs overflow-hidden">
-                <div className="p-4 bg-gradient-to-r from-indigo-900 to-slate-900 text-white flex items-center justify-between">
-                  <div>
-                    <h3 className="text-sm font-bold flex items-center gap-2">
-                      <ShieldCheck className="w-4 h-4 text-emerald-400" />
-                      <span>Subordinate Approvals Desk</span>
-                    </h3>
-                    <p className="text-[11px] text-indigo-200 mt-0.5">
-                      Review and verify documents submitted by your technical staff
-                    </p>
-                  </div>
-                  <span className="text-[10px] font-bold px-2 py-0.5 rounded-full bg-amber-400 text-slate-900">
-                    {pendingForMe.length} Pending
-                  </span>
+                <div className="px-5 py-4 border-b border-slate-100 bg-slate-50/50">
+                  <span className="text-xs font-bold text-slate-800 uppercase tracking-wider">Recent Decisions</span>
                 </div>
-
-                <div className="divide-y divide-slate-100 max-h-[380px] overflow-y-auto">
-                  {pendingForMe.length === 0 ? (
-                    <div className="p-6 text-center text-slate-400 text-xs">
-                      <CheckCircle2 className="w-6 h-6 text-emerald-500 mx-auto mb-1.5" />
-                      <p className="font-semibold text-slate-700">No pending subordinate submissions</p>
-                      <p className="text-[11px] text-slate-400 mt-0.5">All direct report deliverables are up to date.</p>
-                    </div>
+                <div className="divide-y divide-slate-100 max-h-[320px] overflow-y-auto">
+                  {decidedByTeam.length === 0 ? (
+                    <div className="p-5 text-center text-xs text-slate-400">No approvals or revisions yet.</div>
                   ) : (
-                    pendingForMe.map((sub) => (
-                      <div key={sub.id} className="p-4 hover:bg-indigo-50/30 transition-all space-y-3">
-                        <div className="flex items-start justify-between gap-2">
-                          <div>
-                            <div className="font-bold text-slate-900 text-xs">{sub.employeeName}</div>
-                            <div className="text-[10px] text-slate-500">
-                              {sub.employeeDesignation} • Submitted: {sub.submittedDate}
-                            </div>
+                    decidedByTeam.slice(0, 15).map((sub) => (
+                      <div key={sub.id} className="p-3 flex items-center justify-between gap-3 text-xs">
+                        <div className="min-w-0">
+                          <div className="font-semibold text-slate-800 truncate">
+                            {sub.employeeName} • <span className="font-mono text-indigo-600">{sub.kpiCode}</span>
                           </div>
-                          <span className="text-[10px] font-bold px-2 py-0.5 rounded bg-indigo-50 text-indigo-700 border border-indigo-200 font-mono">
-                            {sub.kpiCode}
-                          </span>
-                        </div>
-
-                        <div className="text-xs text-slate-700 font-medium">{sub.kpiName}</div>
-                        <div className="text-[11px] text-slate-500">
-                          Achieved {sub.achievedValue} / target {sub.targetValue} {sub.unit}
-                        </div>
-
-                        {/* Attached Document Card */}
-                        <div className="bg-slate-50 p-2.5 rounded-xl border border-slate-200 flex items-center justify-between text-xs">
-                          <div className="flex items-center gap-2 truncate">
-                            <FileText className="w-4 h-4 text-indigo-600 shrink-0" />
-                            <div className="truncate">
-                              <span className="font-semibold text-slate-800 block truncate">{sub.document.fileName}</span>
-                              <span className="text-[10px] text-slate-400">{sub.document.fileSize} • {sub.document.fileType}</span>
-                            </div>
-                          </div>
-                          <div className="flex items-center gap-1.5 shrink-0 ml-2">
-                            <button
-                              onClick={() => handleViewDoc(sub)}
-                              className="p-1 hover:bg-slate-200 text-slate-600 rounded"
-                              title="Preview Document"
-                            >
-                              <Eye className="w-3.5 h-3.5" />
-                            </button>
-                            <button
-                              onClick={() => handleDownloadDoc(sub)}
-                              className="p-1 hover:bg-slate-200 text-indigo-600 rounded"
-                              title="Download Document"
-                            >
-                              <Download className="w-3.5 h-3.5" />
-                            </button>
+                          <div className="text-[10px] text-slate-500 truncate">
+                            {sub.approvedDate} by {sub.approvedBy || '—'} • {periodName(sub.periodId)}
                           </div>
                         </div>
-
-                        {/* Approval Action Buttons */}
-                        <div className="flex items-center justify-end gap-2 pt-1">
-                          <button
-                            onClick={() => {
-                              setApprovalError('');
-                              setRejectRemarks('');
-                              setApprovalModalSub(sub);
-                              setIsRejectMode(true);
-                            }}
-                            className="px-3 py-1.5 bg-rose-50 hover:bg-rose-100 text-rose-700 border border-rose-200 rounded-lg text-xs font-semibold transition-all"
-                          >
-                            Reject
-                          </button>
-                          <button
-                            onClick={() => {
-                              setApprovalError('');
-                              setApprovalModalSub(sub);
-                              setIsRejectMode(false);
-                              setApprovalRemarks(`Verified and approved by ${currentUser.name}. Points awarded.`);
-                            }}
-                            className="px-3.5 py-1.5 bg-emerald-600 hover:bg-emerald-700 active:scale-95 text-white rounded-lg text-xs font-bold shadow-xs transition-all flex items-center gap-1"
-                          >
-                            <Check className="w-3.5 h-3.5" />
-                            <span>Approve & Award Points</span>
+                        <div className="flex items-center gap-2 shrink-0">
+                          {statusChip(sub)}
+                          <button onClick={() => handleViewDoc(sub)} className="p-1 hover:bg-slate-100 rounded text-slate-600" title="View document">
+                            <Eye className="w-3.5 h-3.5" />
                           </button>
                         </div>
                       </div>
@@ -818,190 +808,6 @@ export const PersonalDashboardView: React.FC<PersonalDashboardViewProps> = ({
         </div>
       )}
 
-
-
-      {/* VIEW 3: HIERARCHY ROLLUP & APPROVALS DESK */}
-      {activeSubTab === 'ROLLUP_DESK' && (
-        <div className="space-y-6">
-          {/* Header Summary Banner */}
-          <div className="bg-gradient-to-r from-slate-900 to-indigo-950 text-white rounded-2xl p-6 border border-slate-800 shadow-md">
-            <div className="flex flex-col md:flex-row md:items-center justify-between gap-4">
-              <div>
-                <div className="flex items-center gap-2">
-                  <Layers className="w-5 h-5 text-emerald-400" />
-                  <h3 className="text-base font-bold">
-                    Hierarchy Rollup & Approval Governance
-                  </h3>
-                </div>
-                <p className="text-xs text-indigo-200 mt-1 max-w-2xl">
-                    {isLevel1
-                    ? 'Head of Department Review: Monitor all department KRAs, verify Level 2 Manager submissions, and authorize period rollups.'
-                    : isLevel2
-                    ? `Manager Rollup: Verify deliverables, award points, and track your consolidated submission routed upward to ${headOfDepartment?.name || 'the Head of Department'}.`
-                    : 'Personal Rollup Status: Track how your approved deliverables roll up to fulfill your reporting manager’s KRA benchmarks.'}
-                </p>
-              </div>
-
-              <div className="flex items-center gap-3">
-                <div className="p-3 bg-white/10 rounded-xl text-center">
-                  <span className="text-[10px] text-indigo-300 block font-bold uppercase">Pending Queue</span>
-                  <span className="text-lg font-black text-amber-400 block">{pendingForMe.length}</span>
-                </div>
-                <div className="p-3 bg-white/10 rounded-xl text-center">
-                  <span className="text-[10px] text-indigo-300 block font-bold uppercase">Approved Deliverables</span>
-                  <span className="text-lg font-black text-emerald-400 block">{approvedForMe.length}</span>
-                </div>
-              </div>
-            </div>
-          </div>
-
-          {/* For Level 2 Managers: My Upward Rollup Submission to HOD */}
-          {isLevel2 && (
-            <div className="bg-white rounded-2xl border border-slate-200 shadow-xs overflow-hidden">
-              <div className="px-5 py-4 border-b border-slate-100 flex items-center justify-between bg-slate-50/50">
-                <div className="flex items-center gap-2">
-                  <ArrowUpRight className="w-4 h-4 text-indigo-600" />
-                  <span className="text-xs font-bold text-slate-800 uppercase tracking-wider">
-                    My Aggregated Rollup Submission to Head of Department
-                  </span>
-                </div>
-                <span className="text-[11px] font-bold text-indigo-600">{headOfDepartment?.name || 'Head of Department'}</span>
-              </div>
-
-              <div className="p-5 space-y-4">
-                <p className="text-xs text-slate-600 leading-relaxed">
-                  When you approve your team's deliverables, your aggregated completion updates and a consolidated KRA achievement package is routed up to {headOfDepartment?.name || 'the Head of Department'} for executive authorization.
-                </p>
-
-                {/* Show manager's upward submission */}
-                {submissions.filter((s) => s.employeeId === currentUser.id && s.isManagerRollup).length === 0 ? (
-                  <div className="p-5 rounded-xl border border-dashed border-slate-300 text-center text-xs text-slate-400">
-                    <p className="font-semibold text-slate-700">Rollup Package Ready for Generation</p>
-                    <p className="mt-1">
-                      Approve pending deliverables to generate and update your consolidated submission to {headOfDepartment?.name || 'the Head of Department'}.
-                    </p>
-                  </div>
-                ) : (
-                  submissions
-                    .filter((s) => s.employeeId === currentUser.id && s.isManagerRollup)
-                    .map((sub) => (
-                      <div
-                        key={sub.id}
-                        className="p-4 rounded-xl border border-indigo-200 bg-indigo-50/40 flex flex-col sm:flex-row sm:items-center justify-between gap-4"
-                      >
-                        <div className="space-y-1">
-                          <div className="flex items-center gap-2">
-                            <span className="font-bold text-xs text-slate-900">{sub.kpiName}</span>
-                            <span className="text-[10px] font-bold px-2 py-0.5 rounded bg-white text-indigo-700 border border-indigo-200 font-mono">
-                              {sub.kpiCode}
-                            </span>
-                            {sub.status === 'APPROVED' ? (
-                              <span className="text-[10px] font-bold px-2 py-0.5 rounded-full bg-emerald-100 text-emerald-800">
-                                GM Approved
-                              </span>
-                            ) : (
-                              <span className="text-[10px] font-bold px-2 py-0.5 rounded-full bg-amber-100 text-amber-800">
-                                Pending GM Review
-                              </span>
-                            )}
-                          </div>
-                          <p className="text-xs text-slate-600">{sub.notes}</p>
-                          <div className="text-[11px] text-slate-400">
-                            Attached File: <strong className="text-slate-700">{sub.document.fileName}</strong> ({sub.document.fileSize})
-                          </div>
-                        </div>
-
-                        <div className="flex items-center gap-2 shrink-0">
-                          <button
-                            onClick={() => handleViewDoc(sub)}
-                            className="px-3 py-1.5 bg-white hover:bg-slate-50 text-slate-700 rounded-lg text-xs font-semibold border border-slate-200"
-                          >
-                            View Dossier
-                          </button>
-                        </div>
-                      </div>
-                    ))
-                )}
-              </div>
-            </div>
-          )}
-
-          {/* For Level 1 HOD: Pending for GM Review Queue (Wing Managers' Rollup Submissions) */}
-          {isLevel1 && (
-            <div className="bg-white rounded-2xl border border-slate-200 shadow-xs overflow-hidden">
-              <div className="px-5 py-4 border-b border-slate-100 flex items-center justify-between bg-gradient-to-r from-amber-900/90 to-slate-900 text-white">
-                <div className="flex items-center gap-2">
-                  <Crown className="w-4 h-4 text-amber-400" />
-                  <span className="text-xs font-bold uppercase tracking-wider">
-                    Executive Review Queue: Level 2 Wing Managers' Rollup Submissions
-                  </span>
-                </div>
-                <span className="text-[10px] font-bold px-2 py-0.5 rounded-full bg-amber-400 text-slate-900">
-                  {submissions.filter((s) => s.managerId === currentUser.id && s.isManagerRollup && s.status === 'PENDING_APPROVAL').length} Pending GM Sign-off
-                </span>
-              </div>
-
-              <div className="divide-y divide-slate-100 max-h-[400px] overflow-y-auto">
-                {submissions.filter((s) => s.managerId === currentUser.id && s.isManagerRollup && s.status === 'PENDING_APPROVAL').length === 0 ? (
-                  <div className="p-8 text-center text-slate-400 text-xs">
-                    <CheckCircle2 className="w-8 h-8 text-emerald-500 mx-auto mb-2" />
-                    <p className="font-semibold text-slate-700">All Wing Manager Rollups Authorized</p>
-                    <p className="mt-1">No consolidated wing submissions pending executive GM review.</p>
-                  </div>
-                ) : (
-                  submissions
-                    .filter((s) => s.managerId === currentUser.id && s.isManagerRollup && s.status === 'PENDING_APPROVAL')
-                    .map((sub) => (
-                      <div key={sub.id} className="p-5 hover:bg-amber-50/30 transition-all flex flex-col sm:flex-row sm:items-center justify-between gap-4">
-                        <div className="space-y-1.5 flex-1 min-w-0">
-                          <div className="flex flex-wrap items-center gap-2">
-                            <span className="font-bold text-xs text-slate-900">{sub.employeeName} ({sub.employeeDesignation})</span>
-                            <span className="text-[10px] font-bold px-2 py-0.5 rounded bg-slate-100 text-slate-700 font-mono">
-                              {sub.kpiCode}
-                            </span>
-                            <span className="text-[10px] font-bold px-2 py-0.5 rounded-full bg-amber-100 text-amber-800">
-                              Awaiting GM Sign-off
-                            </span>
-                          </div>
-
-                          <p className="text-xs text-slate-700 font-medium">{sub.kpiName}</p>
-                          <p className="text-xs text-slate-600 bg-slate-50 p-2 rounded-lg border border-slate-100">
-                            {sub.notes}
-                          </p>
-                          <div className="text-[11px] text-slate-400">
-                            Consolidated Dossier: <strong className="text-slate-700">{sub.document.fileName}</strong> ({sub.document.fileSize})
-                          </div>
-                        </div>
-
-                        <div className="flex items-center gap-2 shrink-0">
-                          <button
-                            onClick={() => handleViewDoc(sub)}
-                            className="px-3 py-1.5 bg-slate-100 hover:bg-slate-200 text-slate-700 rounded-lg text-xs font-semibold"
-                          >
-                            Inspect Dossier
-                          </button>
-                          <button
-                            onClick={() => {
-                              setApprovalError('');
-                              setApprovalModalSub(sub);
-                              setIsRejectMode(false);
-                              setApprovalRemarks(`Executive authorization approved by ${currentUser.name} (${currentUser.designation}).`);
-                            }}
-                            className="px-4 py-1.5 bg-emerald-600 hover:bg-emerald-700 text-white rounded-lg text-xs font-bold flex items-center gap-1 shadow-sm"
-                          >
-                            <Check className="w-3.5 h-3.5" />
-                            <span>Executive Sign-off</span>
-                          </button>
-                        </div>
-                      </div>
-                    ))
-                )}
-              </div>
-            </div>
-          )}
-        </div>
-      )}
-
       {/* Modal: Submit Work & Upload Document */}
       {isSubmitModalOpen && (
         <div className="fixed inset-0 z-50 flex items-center justify-center bg-slate-900/60 backdrop-blur-xs p-4 overflow-y-auto">
@@ -1011,17 +817,18 @@ export const PersonalDashboardView: React.FC<PersonalDashboardViewProps> = ({
                 <FileUp className="w-5 h-5 text-indigo-600" />
                 <h3 className="text-base font-bold text-slate-900">Submit KRA Deliverable & Upload Document</h3>
               </div>
-              <button onClick={() => setIsSubmitModalOpen(false)} className="text-slate-400 hover:text-slate-600">
+              <button onClick={() => setIsSubmitModalOpen(false)} className="text-slate-400 hover:text-slate-600" aria-label="Close">
                 <X className="w-5 h-5" />
               </button>
             </div>
 
             <form onSubmit={handleSubmitWork} className="space-y-4 text-xs">
               <div>
-                <label className="font-semibold text-slate-700 block mb-1">
+                <label className="font-semibold text-slate-700 block mb-1" htmlFor="submit-kpi">
                   Select Assigned KPI / Deliverable ({currentUser.department})
                 </label>
                 <select
+                  id="submit-kpi"
                   required
                   value={selectedKpiId}
                   onChange={(e) => {
@@ -1048,12 +855,7 @@ export const PersonalDashboardView: React.FC<PersonalDashboardViewProps> = ({
                   <label className="font-semibold text-slate-700 block mb-1">
                     Benchmark Target {selectedKpiId && `(${kpis.find((k) => k.id === selectedKpiId)?.unit})`}
                   </label>
-                  <input
-                    type="number"
-                    disabled
-                    value={targetVal}
-                    className="w-full px-3 py-2 bg-slate-100 border border-slate-200 rounded-xl text-slate-600 font-bold"
-                  />
+                  <input type="number" disabled value={targetVal} className="w-full px-3 py-2 bg-slate-100 border border-slate-200 rounded-xl text-slate-600 font-bold" />
                   {selectedKpiId && (
                     <span className="text-[10px] text-slate-400">
                       {kpis.find((k) => k.id === selectedKpiId)?.direction.replace(/_/g, ' ').toLowerCase()}
@@ -1061,8 +863,11 @@ export const PersonalDashboardView: React.FC<PersonalDashboardViewProps> = ({
                   )}
                 </div>
                 <div>
-                  <label className="font-semibold text-slate-700 block mb-1">Achieved Output</label>
+                  <label className="font-semibold text-slate-700 block mb-1" htmlFor="achieved-value">
+                    Achieved Output
+                  </label>
                   <input
+                    id="achieved-value"
                     type="number"
                     step="any"
                     required
@@ -1073,10 +878,9 @@ export const PersonalDashboardView: React.FC<PersonalDashboardViewProps> = ({
                 </div>
               </div>
 
-              {/* Document File Upload */}
               <div>
                 <label className="font-semibold text-slate-700 block mb-1">
-                  Attach Verification Document <span className="text-indigo-600 font-bold">(PDF, DOC, DOCX, PNG, JPG)</span>
+                  Attach Verification Document <span className="text-indigo-600 font-bold">(PDF, DOC, DOCX, XLSX, PNG, JPG — max 3 MB)</span>
                 </label>
                 <div className="border-2 border-dashed border-slate-300 rounded-xl p-4 text-center hover:border-indigo-500 transition-all bg-slate-50">
                   <input
@@ -1093,7 +897,9 @@ export const PersonalDashboardView: React.FC<PersonalDashboardViewProps> = ({
                     </span>
                     <span className="text-[10px] text-slate-400 block mt-0.5">
                       {selectedFile
-                        ? `${(selectedFile.size / 1024).toFixed(1)} KB • File attached`
+                        ? fileBase64
+                          ? `${(selectedFile.size / 1024).toFixed(1)} KB • File attached`
+                          : 'Reading file…'
                         : 'PDF drawings, sanction reports, PNG photos, or DOCX memos'}
                     </span>
                   </label>
@@ -1101,8 +907,11 @@ export const PersonalDashboardView: React.FC<PersonalDashboardViewProps> = ({
               </div>
 
               <div>
-                <label className="font-semibold text-slate-700 block mb-1">Submission Notes & Description</label>
+                <label className="font-semibold text-slate-700 block mb-1" htmlFor="submit-notes">
+                  Submission Notes & Description
+                </label>
                 <textarea
+                  id="submit-notes"
                   rows={3}
                   required
                   value={notes}
@@ -1112,21 +921,18 @@ export const PersonalDashboardView: React.FC<PersonalDashboardViewProps> = ({
                 />
               </div>
 
-              {/* Locked Org Chart Manager Badge */}
               <div className="p-3 bg-emerald-50 rounded-xl border border-emerald-200 text-xs text-emerald-950 leading-relaxed space-y-1">
                 <div className="flex items-center gap-1.5 font-bold text-emerald-800">
                   <ShieldCheck className="w-4 h-4 text-emerald-600 shrink-0" />
-                  <span>Strict Org Chart Routing (Enforced)</span>
+                  <span>Routed to your reporting manager</span>
                 </div>
                 <p>
-                  Assigned Manager: <strong className="text-emerald-900">{reportingManager?.name || currentUser.managerName}</strong>.
-                  Your uploaded document is confidential: only you, your reporting manager, the Head of Department and auditors can open it.
+                  Approver: <strong className="text-emerald-900">{reportingManager?.name || currentUser.managerName}</strong>. Only you, your
+                  reporting manager, the Head of Department, administrators and auditors can open the document.
                 </p>
               </div>
 
-              {submitError && (
-                <div className="p-2.5 rounded-lg bg-rose-50 border border-rose-200 text-rose-700">{submitError}</div>
-              )}
+              {submitError && <div className="p-2.5 rounded-lg bg-rose-50 border border-rose-200 text-rose-700">{submitError}</div>}
 
               <div className="flex justify-end gap-2 pt-2">
                 <button
@@ -1138,10 +944,17 @@ export const PersonalDashboardView: React.FC<PersonalDashboardViewProps> = ({
                 </button>
                 <button
                   type="submit"
-                  disabled={isSubmitting}
-                  className="px-5 py-2 bg-brand-gradient hover:opacity-90 text-white rounded-xl font-bold shadow-md shadow-indigo-600/30 transition-all flex items-center gap-1.5"
+                  disabled={isSubmitting || (Boolean(selectedFile) && !fileBase64)}
+                  className="px-5 py-2 bg-brand-gradient hover:opacity-90 text-white rounded-xl font-bold shadow-md shadow-indigo-600/30 transition-all flex items-center gap-1.5 disabled:opacity-50"
                 >
-                  {isSubmitting ? <span>Submitting...</span> : <><Send className="w-3.5 h-3.5" /><span>Submit to Manager</span></>}
+                  {isSubmitting ? (
+                    <span>Submitting...</span>
+                  ) : (
+                    <>
+                      <Send className="w-3.5 h-3.5" />
+                      <span>Submit to Manager</span>
+                    </>
+                  )}
                 </button>
               </div>
             </form>
@@ -1149,80 +962,29 @@ export const PersonalDashboardView: React.FC<PersonalDashboardViewProps> = ({
         </div>
       )}
 
-      {/* Modal: Document Inspector & Viewer */}
+      {/* Modal: Document Viewer (fetches the file from the server on open) */}
       {inspectingDoc && (
-        <div className="fixed inset-0 z-50 flex items-center justify-center bg-slate-900/60 backdrop-blur-xs p-4">
-          <div className="bg-white rounded-2xl shadow-2xl border border-slate-200 max-w-2xl w-full p-6 space-y-4">
-            <div className="flex items-center justify-between border-b border-slate-100 pb-3">
-              <div className="flex items-center gap-2">
-                <FileText className="w-5 h-5 text-indigo-600" />
-                <div>
-                  <h3 className="text-base font-bold text-slate-900">{inspectingDoc.document.fileName}</h3>
-                  <p className="text-[10px] text-slate-400">
-                    Uploaded by {inspectingDoc.employeeName} ({inspectingDoc.employeeDesignation}) on {inspectingDoc.submittedDate}
-                  </p>
-                </div>
-              </div>
-              <button onClick={() => setInspectingDoc(null)} className="text-slate-400 hover:text-slate-600">
-                <X className="w-5 h-5" />
-              </button>
-            </div>
-
-            {/* Document Preview Box */}
-            <div className="border border-slate-200 rounded-xl p-6 bg-slate-50 min-h-[220px] flex flex-col items-center justify-center text-center">
-              {['PNG', 'JPG', 'JPEG'].includes(inspectingDoc.document.fileType?.toUpperCase()) && inspectingDoc.document.fileData ? (
-                <div className="space-y-3">
-                  <div className="w-64 h-48 rounded-xl bg-slate-200 border border-slate-300 flex items-center justify-center mx-auto overflow-hidden">
-                    <img
-                      src={inspectingDoc.document.fileData}
-                      alt="Verification preview"
-                      className="max-h-full max-w-full object-contain"
-                    />
-                  </div>
-                  <div className="text-xs font-semibold text-slate-700">Image Verification Dossier Attached</div>
-                </div>
-              ) : (
-                <div className="space-y-3">
-                  <div className="w-16 h-16 rounded-2xl bg-indigo-100 text-indigo-600 flex items-center justify-center mx-auto">
-                    <FileText className="w-8 h-8" />
-                  </div>
-                  <div>
-                    <div className="text-sm font-bold text-slate-800">{inspectingDoc.document.fileName}</div>
-                    <div className="text-xs text-slate-500 mt-1">
-                      {inspectingDoc.document.fileType} Document • {inspectingDoc.document.fileSize}
-                    </div>
-                  </div>
-                </div>
-              )}
-
-              <div className="mt-4 pt-4 border-t border-slate-200 w-full text-left text-xs text-slate-600">
-                <span className="font-bold text-slate-700 block">Deliverable Scope:</span>
-                <p className="mt-0.5">{inspectingDoc.notes || 'No notes provided.'}</p>
-              </div>
-            </div>
-
-            <div className="flex items-center justify-between pt-2">
-              <span className="text-xs text-slate-500">
-                Status: <strong className="text-slate-800">{inspectingDoc.status}</strong>
+        <DocumentViewerModal
+          fileName={inspectingDoc.document.fileName}
+          subtitle={`Uploaded by ${inspectingDoc.employeeName} (${inspectingDoc.employeeDesignation}) on ${inspectingDoc.submittedDate} • ${inspectingDoc.kpiCode}`}
+          load={async () => {
+            if (!inspectingDoc.document.hasFile) {
+              return { fileName: inspectingDoc.document.fileName, fileType: inspectingDoc.document.fileType, fileData: '', hasFile: false };
+            }
+            return api.getSubmissionDocument(inspectingDoc.id);
+          }}
+          details={
+            <div className="flex flex-wrap justify-between gap-2">
+              <span>
+                <strong className="text-slate-700">Notes:</strong> {inspectingDoc.notes || 'No notes provided.'}
               </span>
-              <div className="flex gap-2">
-                <button
-                  onClick={() => setInspectingDoc(null)}
-                  className="px-4 py-2 border border-slate-300 rounded-xl font-semibold text-slate-700 hover:bg-slate-50 text-xs"
-                >
-                  Close
-                </button>
-                <button
-                  onClick={() => downloadDocument(inspectingDoc)}
-                  className="px-4 py-2 bg-brand-gradient hover:opacity-90 text-white rounded-xl font-bold text-xs flex items-center gap-1.5 shadow-sm"
-                >
-                  <Download className="w-3.5 h-3.5" />
-                  <span>Download Document</span>
-                </button>
-              </div>
+              <span>
+                Status: <strong className="text-slate-800">{inspectingDoc.status.replace(/_/g, ' ')}</strong>
+              </span>
             </div>
-          </div>
-        </div>
+          }
+          onClose={() => setInspectingDoc(null)}
+        />
       )}
 
       {/* Modal: Manager Review, Remarks & Approval */}
@@ -1231,38 +993,37 @@ export const PersonalDashboardView: React.FC<PersonalDashboardViewProps> = ({
           <div className="bg-white rounded-2xl shadow-2xl border border-slate-200 max-w-md w-full p-6 space-y-4">
             <div className="flex items-center justify-between border-b border-slate-100 pb-3">
               <div className="flex items-center gap-2">
-                {isRejectMode ? (
-                  <XCircle className="w-5 h-5 text-rose-600" />
-                ) : (
-                  <CheckCircle2 className="w-5 h-5 text-emerald-600" />
-                )}
-                <h3 className="text-base font-bold text-slate-900">
-                  {isRejectMode ? 'Request Revision for Deliverable' : 'Approve & Award Points'}
-                </h3>
+                {isRejectMode ? <XCircle className="w-5 h-5 text-rose-600" /> : <CheckCircle2 className="w-5 h-5 text-emerald-600" />}
+                <h3 className="text-base font-bold text-slate-900">{isRejectMode ? 'Request Revision' : 'Approve & Award Points'}</h3>
               </div>
-              <button
-                onClick={() => setApprovalModalSub(null)}
-                className="text-slate-400 hover:text-slate-600"
-              >
+              <button onClick={() => setApprovalModalSub(null)} className="text-slate-400 hover:text-slate-600" aria-label="Close">
                 <X className="w-5 h-5" />
               </button>
             </div>
 
             <div className="space-y-2 text-xs">
-              <div className="p-3 bg-slate-50 rounded-xl border border-slate-200">
+              <div className="p-3 bg-slate-50 rounded-xl border border-slate-200 space-y-1">
                 <div className="flex justify-between">
                   <span className="text-slate-500">Employee:</span>
                   <span className="font-bold text-slate-800">{approvalModalSub.employeeName}</span>
                 </div>
-                <div className="flex justify-between mt-1">
+                <div className="flex justify-between">
                   <span className="text-slate-500">KPI Code:</span>
                   <span className="font-mono font-bold text-indigo-600">{approvalModalSub.kpiCode}</span>
                 </div>
-                <div className="flex justify-between mt-1">
-                  <span className="text-slate-500">Document Attached:</span>
-                  <span className="font-medium text-slate-700 truncate max-w-[200px]">
+                <div className="flex justify-between">
+                  <span className="text-slate-500">Period:</span>
+                  <span className="font-medium text-slate-700">{periodName(approvalModalSub.periodId)}</span>
+                </div>
+                <div className="flex justify-between items-center gap-2">
+                  <span className="text-slate-500">Document:</span>
+                  <button
+                    onClick={() => handleViewDoc(approvalModalSub)}
+                    className="font-semibold text-indigo-700 hover:underline truncate max-w-[220px] flex items-center gap-1"
+                  >
+                    <Eye className="w-3 h-3 shrink-0" />
                     {approvalModalSub.document.fileName}
-                  </span>
+                  </button>
                 </div>
               </div>
 
@@ -1273,41 +1034,39 @@ export const PersonalDashboardView: React.FC<PersonalDashboardViewProps> = ({
                     <strong>{approvalModalSub.maxPoints} points</strong>
                     {approvalModalSub.isManagerRollup
                       ? ' and the consolidated wing package is authorized.'
-                      : ` and ${approvalModalSub.achievedValue} ${approvalModalSub.unit} is recorded as the ${approvalModalSub.kpiCode} actual for this period.`}
+                      : ` and ${approvalModalSub.achievedValue} ${approvalModalSub.unit} is recorded as the ${approvalModalSub.kpiCode} actual for ${periodName(approvalModalSub.periodId)}.`}
                   </div>
-
                   <div>
-                    <label className="font-semibold text-slate-700 block mb-1">
-                      Manager Approval Remarks (Commendation)
+                    <label className="font-semibold text-slate-700 block mb-1" htmlFor="approve-remarks">
+                      Approval Remarks
                     </label>
                     <textarea
+                      id="approve-remarks"
                       rows={2}
                       value={approvalRemarks}
                       onChange={(e) => setApprovalRemarks(e.target.value)}
-                      placeholder="e.g. Excellent drawing quality. Municipal sanction criteria fully met."
                       className="w-full px-3 py-2 border border-slate-300 rounded-xl text-slate-800"
                     />
                   </div>
                 </>
               ) : (
                 <div>
-                  <label className="font-semibold text-slate-700 block mb-1 text-rose-700">
+                  <label className="font-semibold block mb-1 text-rose-700" htmlFor="reject-remarks">
                     Revision Reason / Required Changes
                   </label>
                   <textarea
+                    id="reject-remarks"
                     rows={3}
                     required
                     value={rejectRemarks}
                     onChange={(e) => setRejectRemarks(e.target.value)}
-                    placeholder="Specify which parts of the drawing, document or calculations require revision..."
+                    placeholder="Specify which parts of the document or figures need revision..."
                     className="w-full px-3 py-2 border border-rose-300 rounded-xl text-slate-800"
                   />
                 </div>
               )}
 
-              {approvalError && (
-                <div className="p-2.5 rounded-lg bg-rose-50 border border-rose-200 text-rose-700">{approvalError}</div>
-              )}
+              {approvalError && <div className="p-2.5 rounded-lg bg-rose-50 border border-rose-200 text-rose-700">{approvalError}</div>}
             </div>
 
             <div className="flex justify-end gap-2 pt-2">
@@ -1323,18 +1082,25 @@ export const PersonalDashboardView: React.FC<PersonalDashboardViewProps> = ({
                   type="button"
                   disabled={isProcessingApproval || !rejectRemarks.trim()}
                   onClick={handleReject}
-                  className="px-4 py-2 bg-rose-600 hover:bg-rose-700 text-white rounded-xl font-bold text-xs"
+                  className="px-4 py-2 bg-rose-600 hover:bg-rose-700 text-white rounded-xl font-bold text-xs disabled:opacity-50"
                 >
-                  {isProcessingApproval ? 'Sending...' : 'Confirm Rejection'}
+                  {isProcessingApproval ? 'Sending...' : 'Send Back for Revision'}
                 </button>
               ) : (
                 <button
                   type="button"
                   disabled={isProcessingApproval}
                   onClick={handleApprove}
-                  className="px-4 py-2 bg-emerald-600 hover:bg-emerald-700 text-white rounded-xl font-bold text-xs flex items-center gap-1.5 shadow-sm"
+                  className="px-4 py-2 bg-emerald-600 hover:bg-emerald-700 text-white rounded-xl font-bold text-xs flex items-center gap-1.5 shadow-sm disabled:opacity-50"
                 >
-                  {isProcessingApproval ? 'Approving...' : <><Check className="w-3.5 h-3.5" /><span>Confirm & Award Points</span></>}
+                  {isProcessingApproval ? (
+                    'Approving...'
+                  ) : (
+                    <>
+                      <Check className="w-3.5 h-3.5" />
+                      <span>Confirm & Award Points</span>
+                    </>
+                  )}
                 </button>
               )}
             </div>
@@ -1345,35 +1111,29 @@ export const PersonalDashboardView: React.FC<PersonalDashboardViewProps> = ({
   );
 };
 
-// Helper function to trigger browser file download of attached deliverable
-function downloadDocument(submission: KPISubmission) {
-  const doc = submission.document;
+/** Fallback download for records that have no stored file (sample data): a plain-text summary */
+function downloadSummary(submission: KPISubmission) {
+  const content =
+    `COMPLIANCE DEPARTMENT DELIVERABLE SUMMARY\n` +
+    `Document on record: ${submission.document.fileName} (no stored file)\n` +
+    `============================================================\n` +
+    `Employee: ${submission.employeeName} (${submission.employeeDesignation})\n` +
+    `KRA: ${submission.kraName}\n` +
+    `KPI Code: ${submission.kpiCode} - ${submission.kpiName}\n` +
+    `Period: ${submission.periodId}\n` +
+    `Achieved: ${submission.achievedValue} / ${submission.targetValue} ${submission.unit}\n` +
+    `Approval Status: ${submission.status}\n` +
+    `Points: ${submission.pointsAwarded} / ${submission.maxPoints}\n` +
+    `Approved By: ${submission.approvedBy || 'Pending Manager'}\n` +
+    `Approval Date: ${submission.approvedDate || 'N/A'}\n` +
+    `Notes: ${submission.notes || 'None'}\n` +
+    `\nSubmission reference: ${submission.id}`;
+  const url = URL.createObjectURL(new Blob([content], { type: 'text/plain' }));
   const link = document.createElement('a');
-
-  if (doc.fileData && doc.fileData.startsWith('data:')) {
-    link.href = doc.fileData;
-  } else {
-    // Generate text/pdf simulation download
-    const content = `COMPLIANCE DEPARTMENT DELIVERABLE SUMMARY\n` +
-      `VERIFIED DELIVERABLE DOCUMENT: ${doc.fileName}\n` +
-      `============================================================\n` +
-      `Employee: ${submission.employeeName} (${submission.employeeDesignation})\n` +
-      `KRA: ${submission.kraName}\n` +
-      `KPI Code: ${submission.kpiCode} - ${submission.kpiName}\n` +
-      `Period: ${submission.periodId}\n` +
-      `Achieved: ${submission.achievedValue} / ${submission.targetValue} ${submission.unit}\n` +
-      `Approval Status: ${submission.status}\n` +
-      `Points: ${submission.pointsAwarded} / ${submission.maxPoints}\n` +
-      `Approved By: ${submission.approvedBy || 'Pending Manager'}\n` +
-      `Approval Date: ${submission.approvedDate || 'N/A'}\n` +
-      `Notes: ${submission.notes || 'None'}\n` +
-      `\nSubmission reference: ${submission.id}`;
-    const blob = new Blob([content], { type: 'text/plain' });
-    link.href = URL.createObjectURL(blob);
-  }
-
-  link.download = doc.fileName || `Deliverable_${submission.kpiCode}.pdf`;
+  link.href = url;
+  link.download = `${submission.kpiCode}_summary.txt`;
   document.body.appendChild(link);
   link.click();
   document.body.removeChild(link);
+  setTimeout(() => URL.revokeObjectURL(url), 10_000);
 }

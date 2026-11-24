@@ -25,6 +25,8 @@ interface SidebarProps {
   activeTab: string;
   onSelectTab: (tab: string) => void;
   pendingApprovalsCount?: number;
+  /** Deliverables waiting for the signed-in user's approval */
+  myApprovalsCount?: number;
   totalKRAWeight: number;
   isValidWeight: boolean;
   currentUser: User | null;
@@ -42,6 +44,7 @@ export const Sidebar: React.FC<SidebarProps> = ({
   activeTab,
   onSelectTab,
   pendingApprovalsCount = 0,
+  myApprovalsCount = 0,
   totalKRAWeight,
   isValidWeight,
   currentUser,
@@ -57,8 +60,17 @@ export const Sidebar: React.FC<SidebarProps> = ({
           id: 'personal_dashboard',
           label: isExecutive ? 'My KRA & Submissions' : isManager ? 'Personal & Wing Dashboard' : 'Personal Dashboard',
           icon: Award,
-          badge: isExecutive ? 'My KRA' : isManager ? 'Approvals' : 'HOD',
-          badgeColor: 'bg-emerald-500/20 text-emerald-300',
+          badge:
+            myApprovalsCount > 0
+              ? `${myApprovalsCount} to approve`
+              : isExecutive
+              ? 'My KRA'
+              : currentUser?.role === 'SUPER_ADMIN'
+              ? 'Admin'
+              : isManager
+              ? 'Approvals'
+              : 'HOD',
+          badgeColor: myApprovalsCount > 0 ? 'bg-rose-500 text-white' : 'bg-emerald-500/20 text-emerald-300',
         },
         { id: 'dashboard', label: 'Department Dashboard', icon: LayoutDashboard },
         {

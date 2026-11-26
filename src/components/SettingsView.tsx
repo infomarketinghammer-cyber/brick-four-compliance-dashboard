@@ -18,6 +18,24 @@ export const SettingsView: React.FC<SettingsViewProps> = ({ settings, onSaveSett
     setFormData({ enforce100PercentWeight: true, ...settings });
   }, [settings]);
 
+  const SETTING_KEYS = [
+    'behindThreshold',
+    'atRiskThreshold',
+    'onTrackThreshold',
+    'maxAchievementCap',
+    'minAchievementFloor',
+    'roundingDecimals',
+    'enforce100PercentWeight',
+  ] as const;
+  const saved: ScoringSettings = { enforce100PercentWeight: true, ...settings };
+  // Save is only offered when something actually differs from the stored configuration
+  const isDirty = SETTING_KEYS.some((k) => {
+    const a = formData[k] as unknown;
+    const b = saved[k] as unknown;
+    if (typeof a === 'number' && typeof b === 'number' && Number.isNaN(a) && Number.isNaN(b)) return false;
+    return k === 'enforce100PercentWeight' ? (a !== false) !== (b !== false) : a !== b;
+  });
+
   const validate = (s: ScoringSettings): string => {
     if (!(s.behindThreshold > 0 && s.behindThreshold < s.atRiskThreshold && s.atRiskThreshold <= s.onTrackThreshold)) {
       return 'Thresholds must satisfy 0 < Behind < At Risk ≤ On Track.';
@@ -159,13 +177,28 @@ export const SettingsView: React.FC<SettingsViewProps> = ({ settings, onSaveSett
             <span className="text-emerald-700 font-bold flex items-center gap-1.5">
               <CheckCircle2 className="w-4 h-4" /> Settings updated — all scores recalculated
             </span>
+          ) : isDirty ? (
+            <div className="flex items-center gap-3">
+              <span className="text-amber-700 font-semibold">Unsaved changes</span>
+              <button
+                type="button"
+                onClick={() => {
+                  setFormData(saved);
+                  setError('');
+                }}
+                className="px-3 py-2 border border-slate-300 rounded-xl font-semibold text-slate-700 hover:bg-slate-50"
+              >
+                Discard
+              </button>
+            </div>
           ) : (
-            <span />
+            <span className="text-slate-400">No changes to save</span>
           )}
 
           <button
             type="submit"
-            disabled={isSaving}
+            disabled={isSaving || !isDirty}
+            title={isDirty ? undefined : 'Change a setting to enable saving'}
             className="flex items-center gap-2 bg-brand-gradient hover:opacity-90 text-white px-5 py-2.5 rounded-xl font-bold shadow-sm transition-all disabled:opacity-50"
           >
             <Save className="w-4 h-4" />

@@ -30,6 +30,9 @@ interface SidebarProps {
   totalKRAWeight: number;
   isValidWeight: boolean;
   currentUser: User | null;
+  /** Below the lg breakpoint the sidebar is an off-canvas drawer */
+  isOpen?: boolean;
+  onClose?: () => void;
 }
 
 interface NavItem {
@@ -48,6 +51,8 @@ export const Sidebar: React.FC<SidebarProps> = ({
   totalKRAWeight,
   isValidWeight,
   currentUser,
+  isOpen = false,
+  onClose,
 }) => {
   const isExecutive = isExecutiveStaff(currentUser);
   const isManager = isManagerUser(currentUser);
@@ -119,13 +124,20 @@ export const Sidebar: React.FC<SidebarProps> = ({
     .filter((g) => g.items.length > 0);
 
   return (
-    <aside className="w-72 bg-brand-gradient text-white flex flex-col shrink-0 border-r border-teal-800/30 h-full select-none z-20">
+    <>
+    {/* Backdrop for the mobile / tablet drawer */}
+    {isOpen && <div className="fixed inset-0 bg-slate-900/50 z-30 lg:hidden" onClick={onClose} aria-hidden="true" />}
+    <aside
+      className={`w-72 max-w-[85vw] bg-brand-gradient text-white flex flex-col shrink-0 border-r border-teal-800/30 h-full select-none z-40
+        fixed inset-y-0 left-0 transition-transform duration-200 lg:static lg:translate-x-0 ${isOpen ? 'translate-x-0' : '-translate-x-full'}`}
+      aria-label="Main navigation"
+    >
       {/* Branding Header */}
       <div className="bg-transparent px-5 py-3.5 border-b border-teal-800/30 shrink-0">
         <div className="flex items-center gap-3">
           <div className="h-10 w-28 flex items-center justify-center">
             <img 
-              src="/logo.jpeg" 
+              src="/logo.png" 
               alt="Brick Four Logo" 
               className="h-full w-full object-contain"
               onError={(e) => {
@@ -158,7 +170,10 @@ export const Sidebar: React.FC<SidebarProps> = ({
                 return (
                   <button
                     key={item.id}
-                    onClick={() => onSelectTab(item.id)}
+                    onClick={() => {
+                      onSelectTab(item.id);
+                      onClose?.();
+                    }}
                     aria-current={isActive ? 'page' : undefined}
                     className={`w-full flex items-center justify-between px-3 py-2 rounded-xl text-xs font-medium transition-all text-left ${
                       isActive
@@ -187,5 +202,6 @@ export const Sidebar: React.FC<SidebarProps> = ({
         ))}
       </div>
     </aside>
+    </>
   );
 };

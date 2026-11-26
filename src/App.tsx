@@ -68,6 +68,7 @@ export default function App() {
   const [notifications, setNotifications] = useState<NotificationItem[]>([]);
   const [reviews, setReviews] = useState<PerformanceReview[]>([]);
   const [myApprovalsCount, setMyApprovalsCount] = useState<number>(0);
+  const [isSidebarOpen, setIsSidebarOpen] = useState<boolean>(false);
 
   // Operational Lists
   const [contracts, setContracts] = useState<ContractRecord[]>([]);
@@ -314,7 +315,7 @@ export default function App() {
       async () => {
         const res = await api.autoCalculateAll(currentPeriodId);
         summary = `Auto-calculated ${res.updatedCount} KPIs from registers` +
-          (res.skippedOverrides.length ? ` (kept ${res.skippedOverrides.length} manual overrides)` : '');
+          (res.skippedOverrides.length ? ` (kept ${res.skippedOverrides.length} overridden or approved-deliverable values)` : '');
       },
       'Auto-calculation complete',
       () => refreshCalculations()
@@ -481,6 +482,8 @@ export default function App() {
         currentUser={currentUser}
         pendingApprovalsCount={currentPeriod.status === 'UNDER_REVIEW' ? 1 : 0}
         myApprovalsCount={myApprovalsCount}
+        isOpen={isSidebarOpen}
+        onClose={() => setIsSidebarOpen(false)}
       />
 
       {/* Right Content Area */}
@@ -495,6 +498,7 @@ export default function App() {
           onOpenNotification={handleOpenNotification}
           onMarkAllNotificationsRead={handleMarkAllNotificationsRead}
           onOpenAIAssistant={() => setIsAIModalOpen(true)}
+          onOpenMenu={() => setIsSidebarOpen(true)}
         />
 
         <main className="flex-1 overflow-y-auto min-h-0 pb-12">

@@ -34,6 +34,7 @@ import {
 import { MongoClient, type Db, type AnyBulkWriteOperation } from 'mongodb';
 import crypto from 'crypto';
 import { hashPassword, isHashedPassword } from './passwords.js';
+import { LEGAL_KRA_RENAMES, LEGAL_KPI_RENAMES, PLACEHOLDER_EVIDENCE_IDS } from './legalFramework.js';
 
 /**
  * System administrator account. A SUPER_ADMIN governs the whole system but is not a participant in the
@@ -391,6 +392,106 @@ class MemoryDatabase {
         u.password = hashPassword(u.password);
         changed = true;
       }
+    }
+
+    // Legal wording for the KRA/KPI framework (only records still carrying the old seed name)
+    const renameRecord = (rec: { name: string; description?: string; unit?: string } | undefined, r: (typeof LEGAL_KRA_RENAMES)[string]) => {
+      if (!rec || rec.name !== r.oldName) return false;
+      rec.name = r.name;
+      rec.description = r.description;
+      if (r.unit) rec.unit = r.unit;
+      return true;
+    };
+    for (const [id, r] of Object.entries(LEGAL_KRA_RENAMES)) {
+      const kra = this.state.kras.find((k) => k.id === id);
+      if (renameRecord(kra, r)) changed = true;
+      for (const s of this.state.submissions) {
+        if (s.kraId === id && s.kraName === r.oldName) {
+          s.kraName = r.name;
+          changed = true;
+        }
+      }
+    }
+    for (const [id, r] of Object.entries(LEGAL_KPI_RENAMES)) {
+      const kpi = this.state.kpis.find((k) => k.id === id);
+      if (renameRecord(kpi as any, r)) changed = true;
+      for (const s of this.state.submissions) {
+        if (s.kpiId === id && s.kpiName === r.oldName) {
+          s.kpiName = r.name;
+          changed = true;
+        }
+      }
+    }
+
+    // Seeded evidence placeholders that never had an uploaded file cannot be verified by anyone: remove them
+    const before = this.state.evidence.length;
+    this.state.evidence = this.state.evidence.filter(
+      (e) => !(PLACEHOLDER_EVIDENCE_IDS.includes(e.id) && !this.hasStoredFile(e.documentUrl))
+    );
+    if (this.state.evidence.length !== before) changed = true;
+
+    // Submission snapshots must describe the employee as the directory does (designation / level / department)
+    for (const s of this.state.submissions) {
+      if (s.isManagerRollup) continue;
+      const emp = this.state.users.find((u) => u.id === s.employeeId);
+      if (!emp) continue;
+      if (s.employeeDesignation !== emp.designation || s.employeeLevel !== (emp.level || 3) || s.department !== emp.department) {
+        s.employeeDesignation = emp.designation;
+        s.employeeLevel = emp.level || 3;
+        s.department = emp.department;
+        s.wing = emp.wing;
+        changed = true;
+      }
+    }
+    // Seed audit entry recorded Archana with a role she never held
+    for (const a of this.state.auditLogs) {
+      if (a.id !== 'aud-03') continue;
+      const u = this.state.users.find((x) => x.name === a.userName);
+      if (u && a.userRole !== u.role) {
+        a.userRole = u.role;
+        changed = true;
+      }
+    }
+
+    if (this.reconcileApprovedDeliverables()) changed = true;
+    return changed;
+  }
+
+  /**
+   * An approved staff deliverable is the authoritative actual for its KPI and period, unless something newer
+   * replaced it (a manual entry or an authorized override). Fixes records where an automatic register
+   * calculation had overwritten an approved value (e.g. K1-KPI-01: approved 96, measurement still 75).
+   */
+  private reconcileApprovedDeliverables(): boolean {
+    let changed = false;
+    const latest = new Map<string, KPISubmission>();
+    for (const s of this.state.submissions) {
+      if (s.status !== 'APPROVED' || s.isManagerRollup || !s.approvedDate) continue;
+      const key = `${s.organizationId}|${s.kpiId}|${s.periodId}`;
+      const prev = latest.get(key);
+      if (!prev || (prev.approvedDate || '') < s.approvedDate) latest.set(key, s);
+    }
+    for (const sub of latest.values()) {
+      const kpi = this.state.kpis.find((k) => k.id === sub.kpiId);
+      const period = this.state.periods.find((p) => p.id === sub.periodId && p.organizationId === sub.organizationId);
+      if (!kpi || !period || period.status === 'LOCKED') continue;
+      const m = this.state.measurements.find(
+        (x) => x.kpiId === sub.kpiId && x.periodId === sub.periodId && x.organizationId === sub.organizationId
+      );
+      if (!m || m.isManuallyOverridden || m.sourceSubmissionId === sub.id) continue;
+      // A manual entry made after the approval is newer information: keep it
+      const enteredOn = (m.submittedDate || '').slice(0, 10);
+      if (!m.calculatedAutomatically && enteredOn > (sub.approvedDate || '')) continue;
+      const calc = calculateKPIAchievement(kpi, sub.achievedValue, kpi.targetValue, this.getScoringSettings(sub.organizationId));
+      m.actual = sub.achievedValue;
+      m.target = kpi.targetValue;
+      m.achievement = calc.achievement;
+      m.weightedScore = calc.weightedScore;
+      m.status = calc.status;
+      m.calculatedAutomatically = false;
+      m.sourceSubmissionId = sub.id;
+      m.comments = `Actual from deliverable approved by ${sub.approvedBy || 'manager'} on ${sub.approvedDate}.`;
+      changed = true;
     }
     return changed;
   }
@@ -2686,9 +2787,65 @@ class MemoryDatabase {
   }
 
   public getMeasurements(orgId: string, periodId?: string): KPIMeasurement[] {
-    return this.state.measurements.filter(
+    const direct = this.state.measurements.filter(
       (m) => m.organizationId === orgId && (!periodId || m.periodId === periodId)
     );
+    if (!periodId) return direct;
+    const period = this.state.periods.find((p) => p.id === periodId && p.organizationId === orgId);
+    if (!period || period.type === 'MONTHLY') return direct;
+    return [...direct, ...this.deriveRollupMeasurements(orgId, period, new Set(direct.map((m) => m.kpiId)))];
+  }
+
+  /**
+   * Quarterly / longer periods roll up their months: for every KPI without its own entry for the period,
+   * the actual is the average of the monthly actuals recorded inside the period's date range.
+   * These records are computed on the fly (never stored), so they always reflect the latest monthly data.
+   */
+  private deriveRollupMeasurements(orgId: string, period: PerformancePeriod, alreadyMeasured: Set<string>): KPIMeasurement[] {
+    const months = this.state.periods
+      .filter(
+        (p) => p.organizationId === orgId && p.type === 'MONTHLY' && p.startDate >= period.startDate && p.endDate <= period.endDate
+      )
+      .sort((a, b) => a.startDate.localeCompare(b.startDate));
+    if (months.length === 0) return [];
+    const monthIds = new Set(months.map((p) => p.id));
+    const settings = this.getScoringSettings(orgId);
+
+    const byKpi = new Map<string, KPIMeasurement[]>();
+    for (const m of this.state.measurements) {
+      if (m.organizationId !== orgId || !monthIds.has(m.periodId) || alreadyMeasured.has(m.kpiId)) continue;
+      const list = byKpi.get(m.kpiId) || [];
+      list.push(m);
+      byKpi.set(m.kpiId, list);
+    }
+
+    const derived: KPIMeasurement[] = [];
+    for (const [kpiId, list] of byKpi) {
+      const kpi = this.state.kpis.find((k) => k.id === kpiId);
+      if (!kpi) continue;
+      const actual = Math.round((list.reduce((a, m) => a + m.actual, 0) / list.length) * 100) / 100;
+      const calc = calculateKPIAchievement(kpi, actual, kpi.targetValue, settings);
+      const monthNames = months.filter((p) => list.some((m) => m.periodId === p.id)).map((p) => p.name.split(' ')[0]);
+      derived.push({
+        id: `msr-${kpiId}-${period.id}-rollup`,
+        organizationId: orgId,
+        kpiId,
+        periodId: period.id,
+        target: kpi.targetValue,
+        actual,
+        achievement: calc.achievement,
+        weightedScore: calc.weightedScore,
+        status: calc.status,
+        approvalStatus: list.every((m) => m.approvalStatus === 'APPROVED') ? 'APPROVED' : 'DRAFT',
+        calculatedAutomatically: true,
+        isManuallyOverridden: false,
+        isDerivedRollup: true,
+        comments: `Quarter roll-up: average of ${list.length} monthly actual(s) (${monthNames.join(', ')}).`,
+        submittedBy: 'SYSTEM_ROLLUP',
+        submittedDate: new Date().toISOString(),
+      });
+    }
+    return derived;
   }
 
   public getSubmissions(
@@ -2826,6 +2983,8 @@ class MemoryDatabase {
         measurement.approvalStatus = 'APPROVED';
         measurement.approvedBy = approverName;
         measurement.approvedDate = sub.approvedDate;
+        measurement.isManuallyOverridden = false;
+        measurement.sourceSubmissionId = sub.id;
       } else {
         measurement = {
           id: `msr-${sub.kpiId}-${sub.periodId}`,
@@ -2844,6 +3003,7 @@ class MemoryDatabase {
           submittedDate: sub.submittedDate,
           approvedBy: approverName,
           approvedDate: sub.approvedDate,
+          sourceSubmissionId: sub.id,
         };
         this.state.measurements.push(measurement);
       }

@@ -253,10 +253,26 @@ export function createApp() {
   };
 
   // Evidence files: those created from a submission follow that submission's rule; others are governance documents
-  const canAccessEvidenceFile = (u: SessionUser, ev: { id: string }) => {
+  const canAccessEvidenceFile = (u: SessionUser, ev: { id: string; kpiId: string }) => {
     const sub = db.getState().submissions.find((s) => `ev-${s.id}` === ev.id);
     if (sub) return canAccessSubmissionFile(u, sub);
-    return isAdminRole(u.role) || u.role === 'AUDITOR' || u.role === 'MANAGEMENT';
+    if (isAdminRole(u.role) || u.role === 'AUDITOR' || u.role === 'MANAGEMENT') return true;
+    // Governance evidence is shared with the people responsible for that KPI
+    return kpiRecipients(ev.kpiId).includes(u.id);
+  };
+
+  // Users responsible for a KPI: its owner and everyone it (or its KRA) is assigned to; never the Super Admin
+  const kpiRecipients = (kpiId: string): string[] => {
+    const state = db.getState();
+    const kpi = state.kpis.find((k) => k.id === kpiId);
+    if (!kpi) return [];
+    return state.users
+      .filter(
+        (u) =>
+          u.role !== 'SUPER_ADMIN' &&
+          (u.id === kpi.ownerId || u.assignedKpis?.includes(kpi.id) || u.assignedKras?.includes(kpi.kraId))
+      )
+      .map((u) => u.id);
   };
 
   // Health check
@@ -810,6 +826,7 @@ export function createApp() {
       measurement.status = calc.status;
       measurement.calculatedAutomatically = false;
       measurement.comments = comments || measurement.comments;
+      measurement.sourceSubmissionId = undefined; // a manual entry replaces any approved-deliverable value
       measurement.submittedBy = currentUser.id;
       measurement.submittedDate = new Date().toISOString();
     } else {
@@ -881,8 +898,8 @@ export function createApp() {
         (m) => m.kpiId === kpi.id && m.periodId === periodId && m.organizationId === orgId
       );
 
-      // Never silently overwrite an authorized manual override
-      if (measurement?.isManuallyOverridden) {
+      // Never silently overwrite an authorized manual override or an actual that came from an approved deliverable
+      if (measurement?.isManuallyOverridden || measurement?.sourceSubmissionId) {
         skippedOverrides.push(kpi.kpiCode);
         continue;
       }
@@ -924,7 +941,7 @@ export function createApp() {
       action: 'AUTO_CALCULATE_MEASUREMENTS',
       entity: 'KPI_ENGINE',
       newValue: `Auto-calculated ${updatedCount.length} KPIs from operational registers for ${periodId}` +
-        (skippedOverrides.length ? ` (kept ${skippedOverrides.length} manual overrides: ${skippedOverrides.join(', ')})` : ''),
+        (skippedOverrides.length ? ` (kept ${skippedOverrides.length} overridden or approved-deliverable values: ${skippedOverrides.join(', ')})` : ''),
     });
 
     res.json({
@@ -1248,6 +1265,18 @@ export function createApp() {
       entityId: newEvidence.id,
       newValue: `Attached document: ${newEvidence.fileName} for KPI ${kpi.kpiCode}`,
     });
+
+    for (const userId of kpiRecipients(kpi.id)) {
+      if (userId === currentUser.id) continue;
+      db.notify({
+        organizationId: orgId,
+        userId,
+        title: 'Document shared with you',
+        message: `${currentUser.name} attached "${newEvidence.fileName}" to your KPI ${kpi.kpiCode} (${kpi.name}).`,
+        type: 'INFO',
+        linkTab: 'personal_dashboard',
+      });
+    }
 
     res.status(201).json(newEvidence);
   });
@@ -1607,7 +1636,13 @@ export function createApp() {
       return res.status(403).json({ error: 'Forbidden: The audit trail is restricted to HOD, administrators and auditors.' });
     }
     const orgId = (req as any).organizationId;
-    res.json(db.getState().auditLogs.filter((l) => l.organizationId === orgId));
+    // Always newest first (timestamps are 'YYYY-MM-DD HH:MM:SS', so string order is chronological)
+    res.json(
+      db
+        .getState()
+        .auditLogs.filter((l) => l.organizationId === orgId)
+        .sort((a, b) => b.timestamp.localeCompare(a.timestamp))
+    );
   });
 
   // Notifications API
@@ -1655,7 +1690,17 @@ export function createApp() {
     const periodId = req.query.periodId as string;
     let list = db.getState().reviews.filter((r) => r.organizationId === orgId);
     if (periodId) list = list.filter((r) => r.periodId === periodId);
-    res.json(list);
+    // overallScore is the snapshot taken at publication; liveScore is the same engine the dashboard uses,
+    // so a review never shows a number that contradicts the dashboard without saying so
+    const kras = db.getKRAs(orgId);
+    const kpis = db.getKPIs(orgId);
+    const settings = db.getScoringSettings(orgId);
+    res.json(
+      list.map((r) => ({
+        ...r,
+        liveScore: computeDepartmentScore(kras, kpis, db.getMeasurements(orgId, r.periodId), settings).overallScore,
+      }))
+    );
   });
 
   app.post('/api/reviews', requireAdmin, (req, res) => {

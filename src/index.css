@@ -9,3 +9,10 @@
   -webkit-background-clip: text;
   -webkit-text-fill-color: transparent;
 }
+
+/* Text selection must stay readable everywhere (a gradient cannot be a ::selection background, so
+   white-on-transparent selections made highlighted text look disabled) */
+::selection {
+  background-color: #99f6e4; /* teal-200 */
+  color: #0f172a; /* slate-900 */
+}

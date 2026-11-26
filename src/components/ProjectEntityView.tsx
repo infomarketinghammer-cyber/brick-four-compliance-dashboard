@@ -52,6 +52,10 @@ export const ProjectEntityView: React.FC<ProjectEntityViewProps> = ({
     const pRisks = inScope(risks);
     const pDD = inScope(dueDiligences);
     const pApprovals = inScope(approvals);
+    const CLOSED_CASE = ['SETTLED', 'DISMISSED', 'CLOSED'];
+    const activeCases = pLitigation.filter((l) => !CLOSED_CASE.includes(l.caseStatus));
+    // Waived obligations are legally excused, so they are neither compliant nor non-compliant
+    const trackedCompliance = pCompliance.filter((c) => c.status !== 'WAIVED');
     const completed = pContracts.filter((c) => c.status === 'APPROVED' || c.status === 'EXECUTED');
     const tats = completed.filter((c) => c.actualTATDays !== undefined).map((c) => c.actualTATDays!);
 
@@ -60,14 +64,17 @@ export const ProjectEntityView: React.FC<ProjectEntityViewProps> = ({
       contractsWithinSla: completed.filter((c) => c.isWithinSLA).length,
       contractsCompleted: completed.length,
       avgTat: tats.length ? Math.round((tats.reduce((a, b) => a + b, 0) / tats.length) * 10) / 10 : null,
-      compliant: pCompliance.filter((c) => c.status === 'COMPLIANT').length,
-      complianceTotal: pCompliance.length,
+      compliant: trackedCompliance.filter((c) => c.status === 'COMPLIANT').length,
+      complianceTotal: trackedCompliance.length,
+      complianceWaived: pCompliance.length - trackedCompliance.length,
       complianceOverdue: pCompliance.filter((c) => c.status === 'OVERDUE').length,
-      activeLitigation: pLitigation.filter((l) => !['SETTLED', 'DISMISSED', 'CLOSED'].includes(l.caseStatus)).length,
-      exposure: pLitigation.reduce((a, l) => a + (l.estimatedExposureINR || 0), 0),
+      activeLitigation: activeCases.length,
+      // Only live cases carry exposure; settled / dismissed / closed matters are no longer a financial risk
+      exposure: activeCases.reduce((a, l) => a + (l.estimatedExposureINR || 0), 0),
       openNotices: pNotices.filter((n) => !['RESPONDED', 'SETTLED'].includes(n.status)).length,
       openHighRisks: pRisks.filter((r) => (r.riskLevel === 'HIGH' || r.riskLevel === 'CRITICAL') && r.status !== 'MITIGATED').length,
       ddCleared: pDD.filter((d) => d.legalClearanceStatus === 'CLEARED').length,
+      ddRejected: pDD.filter((d) => d.legalClearanceStatus === 'REJECTED').length,
       ddTotal: pDD.length,
       approvalsObtained: pApprovals.filter((a) => a.status === 'OBTAINED').length,
       approvalsTotal: pApprovals.length,
@@ -75,7 +82,8 @@ export const ProjectEntityView: React.FC<ProjectEntityViewProps> = ({
         pCompliance.filter((c) => c.status === 'OVERDUE').length +
         pNotices.filter((n) => n.status === 'OVERDUE').length +
         pRisks.filter((r) => (r.riskLevel === 'HIGH' || r.riskLevel === 'CRITICAL') && r.status !== 'MITIGATED').length +
-        pApprovals.filter((a) => a.status === 'OVERDUE' || a.status === 'QUERY_RAISED').length,
+        pApprovals.filter((a) => a.status === 'OVERDUE' || a.status === 'QUERY_RAISED' || a.status === 'EXPIRED').length +
+        pDD.filter((d) => d.legalClearanceStatus === 'REJECTED').length,
     };
   };
 
@@ -90,7 +98,8 @@ export const ProjectEntityView: React.FC<ProjectEntityViewProps> = ({
             Project & Corporate Entity Legal Scorecards
           </h2>
           <p className="text-xs text-slate-500 mt-1">
-            RERA statutory health, litigation exposure, and register activity per development and SPV.
+            Read-only legal health check per project and per company, calculated live from the Operational Registers
+            (contracts, compliance, litigation, notices, risks, due diligence and approvals tagged to each project).
           </p>
         </div>
 
@@ -167,7 +176,7 @@ export const ProjectEntityView: React.FC<ProjectEntityViewProps> = ({
                   </div>
                   <div className="h-8 w-px bg-slate-200" />
                   <div>
-                    <div className="text-[10px] text-slate-400 font-semibold uppercase">Litigation Exposure</div>
+                    <div className="text-[10px] text-slate-400 font-semibold uppercase">Active Litigation Exposure</div>
                     <div className="text-sm font-bold text-slate-800">{cr(h.exposure)}</div>
                   </div>
                 </div>
@@ -179,13 +188,17 @@ export const ProjectEntityView: React.FC<ProjectEntityViewProps> = ({
                   <div className={`text-lg font-bold mt-1 ${h.complianceOverdue ? 'text-rose-600' : 'text-emerald-600'}`}>
                     {h.complianceTotal ? `${h.compliant}/${h.complianceTotal} compliant` : 'None tracked'}
                   </div>
-                  <p className="text-[11px] text-slate-500 mt-1">{h.complianceOverdue} overdue</p>
+                  <p className="text-[11px] text-slate-500 mt-1">
+                    {h.complianceOverdue} overdue{h.complianceWaived ? `, ${h.complianceWaived} waived` : ''}
+                  </p>
                 </div>
 
                 <div className="p-4 rounded-xl border border-slate-100 bg-slate-50/50">
                   <span className="text-xs font-bold text-slate-700">Title Due Diligence</span>
                   <div className="text-lg font-bold text-slate-900 mt-1">{h.ddTotal ? `${h.ddCleared}/${h.ddTotal} cleared` : 'None recorded'}</div>
-                  <p className="text-[11px] text-slate-500 mt-1">Approvals: {h.approvalsObtained}/{h.approvalsTotal} obtained</p>
+                  <p className="text-[11px] text-slate-500 mt-1">
+                    {h.ddRejected ? `${h.ddRejected} rejected • ` : ''}Approvals: {h.approvalsObtained}/{h.approvalsTotal} obtained
+                  </p>
                 </div>
 
                 <div className="p-4 rounded-xl border border-slate-100 bg-slate-50/50">
@@ -221,7 +234,7 @@ export const ProjectEntityView: React.FC<ProjectEntityViewProps> = ({
                   <th className="py-3 px-3">CIN</th>
                   <th className="py-3 px-3">Projects</th>
                   <th className="py-3 px-3">Compliance</th>
-                  <th className="py-3 px-3">Litigation Exposure</th>
+                  <th className="py-3 px-3">Active Litigation Exposure</th>
                   <th className="py-3 px-4 text-right">Open Issues</th>
                 </tr>
               </thead>
@@ -249,13 +262,19 @@ export const ProjectEntityView: React.FC<ProjectEntityViewProps> = ({
                       </td>
                       <td className="py-3 px-3 font-semibold text-slate-800">{cr(ch.exposure)}</td>
                       <td className="py-3 px-4 text-right">
-                        <span
-                          className={`inline-block px-2.5 py-0.5 rounded-full font-bold border ${
-                            ch.openIssues ? 'text-amber-700 bg-amber-50 border-amber-200' : 'text-emerald-700 bg-emerald-50 border-emerald-200'
-                          }`}
-                        >
-                          {ch.openIssues ? `${ch.openIssues} open` : 'COMPLIANT'}
-                        </span>
+                        {companyProjects.length === 0 ? (
+                          <span className="inline-block px-2.5 py-0.5 rounded-full font-bold border text-slate-500 bg-slate-50 border-slate-200">
+                            No projects
+                          </span>
+                        ) : (
+                          <span
+                            className={`inline-block px-2.5 py-0.5 rounded-full font-bold border ${
+                              ch.openIssues ? 'text-amber-700 bg-amber-50 border-amber-200' : 'text-emerald-700 bg-emerald-50 border-emerald-200'
+                            }`}
+                          >
+                            {ch.openIssues ? `${ch.openIssues} open` : 'COMPLIANT'}
+                          </span>
+                        )}
                       </td>
                     </tr>
                   );

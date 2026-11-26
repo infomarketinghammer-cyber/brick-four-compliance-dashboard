@@ -46,14 +46,14 @@ export const LoginView: React.FC<LoginViewProps> = ({ onLoginSuccess }) => {
   };
 
   return (
-    <div className="min-h-screen bg-slate-50 text-slate-900 flex flex-col justify-between selection:bg-brand-gradient selection:text-white">
+    <div className="min-h-screen bg-slate-50 text-slate-900 flex flex-col justify-between selection:bg-teal-200 selection:text-slate-900">
       {/* Top Bar with Clean White Logo Header */}
       <header className="bg-brand-gradient border-b border-teal-800/30 px-6 py-3.5 shadow-2xs text-white">
         <div className="max-w-7xl mx-auto flex items-center justify-between">
           <div className="flex items-center gap-3">
             <div className="h-10 w-28 flex items-center justify-center">
               <img
-                src="/logo.jpeg"
+                src="/logo.png"
                 alt="Brick Four Logo"
                 className="h-full w-full object-contain"
                 onError={(e) => {

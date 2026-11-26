@@ -1,5 +1,5 @@
 import React, { useState } from 'react';
-import { Calendar, Bell, Sparkles, X, LogOut } from 'lucide-react';
+import { Calendar, Bell, Sparkles, X, LogOut, Menu } from 'lucide-react';
 import { PerformancePeriod, NotificationItem, User } from '../types';
 
 interface HeaderProps {
@@ -12,6 +12,8 @@ interface HeaderProps {
   onOpenNotification: (n: NotificationItem) => void;
   onMarkAllNotificationsRead: () => void;
   onOpenAIAssistant: () => void;
+  /** Opens the navigation drawer on small screens */
+  onOpenMenu?: () => void;
 }
 
 export const Header: React.FC<HeaderProps> = ({
@@ -24,6 +26,7 @@ export const Header: React.FC<HeaderProps> = ({
   onOpenNotification,
   onMarkAllNotificationsRead,
   onOpenAIAssistant,
+  onOpenMenu,
 }) => {
   const [showNotifications, setShowNotifications] = useState(false);
   const unreadCount = notifications.filter((n) => !n.read).length;
@@ -32,16 +35,23 @@ export const Header: React.FC<HeaderProps> = ({
 
   return (
     <header className="bg-brand-gradient border-b border-teal-800/30 sticky top-0 z-30 shrink-0 h-14 flex items-center text-white">
-      <div className="px-4 lg:px-6 flex items-center justify-end w-full gap-3">
-        <div className="flex items-center gap-2.5 shrink-0">
+      <div className="px-2 sm:px-4 lg:px-6 flex items-center justify-between lg:justify-end w-full gap-2 sm:gap-3 min-w-0">
+        <button
+          onClick={onOpenMenu}
+          className="lg:hidden p-2 -ml-1 rounded-lg hover:bg-white/15 shrink-0"
+          aria-label="Open navigation menu"
+        >
+          <Menu className="w-5 h-5" />
+        </button>
+        <div className="flex items-center gap-1.5 sm:gap-2.5 min-w-0">
           {/* Performance Period Selector */}
-          <div className="flex items-center gap-1.5 bg-white/10 border border-white/20 rounded-lg px-2.5 py-1 text-xs text-white">
+          <div className="flex items-center gap-1.5 bg-white/10 border border-white/20 rounded-lg px-2 sm:px-2.5 py-1 text-xs text-white min-w-0">
             <Calendar className="w-3.5 h-3.5 text-teal-200 shrink-0" />
             <select
               value={currentPeriodId}
               onChange={(e) => onSelectPeriod(e.target.value)}
               aria-label="Performance period"
-              className="bg-transparent font-bold text-white focus:outline-none cursor-pointer [&>option]:bg-slate-900 [&>option]:text-white"
+              className="bg-transparent font-bold text-white focus:outline-none cursor-pointer min-w-0 max-w-[110px] sm:max-w-none [&>option]:bg-slate-900 [&>option]:text-white"
             >
               {periods.map((p) => (
                 <option key={p.id} value={p.id}>
@@ -51,7 +61,7 @@ export const Header: React.FC<HeaderProps> = ({
             </select>
             {currentPeriod && (
               <span
-                className={`ml-1 text-[10px] font-bold px-1.5 py-0.5 rounded ${
+                className={`ml-1 text-[10px] font-bold px-1.5 py-0.5 rounded hidden sm:inline ${
                   currentPeriod.status === 'LOCKED'
                     ? 'bg-slate-200 text-slate-800'
                     : currentPeriod.status === 'APPROVED'
@@ -67,7 +77,8 @@ export const Header: React.FC<HeaderProps> = ({
           {/* AI Legal Intelligence Advisor */}
           <button
             onClick={onOpenAIAssistant}
-            className="flex items-center gap-1.5 px-2.5 py-1.5 bg-white/10 hover:bg-white/20 border border-white/20 rounded-lg text-xs font-bold transition-colors cursor-pointer"
+            className="flex items-center gap-1.5 px-2 sm:px-2.5 py-1.5 bg-white/10 hover:bg-white/20 border border-white/20 rounded-lg text-xs font-bold transition-colors cursor-pointer shrink-0"
+            aria-label="AI Advisor"
             title="Ask the AI Legal Intelligence Advisor"
           >
             <Sparkles className="w-3.5 h-3.5 text-amber-200" />
@@ -76,8 +87,8 @@ export const Header: React.FC<HeaderProps> = ({
 
           {/* Active Logged-in Employee */}
           {currentUser && (
-            <div className="flex items-center gap-2 pl-2 border-l border-white/20">
-              <div className="flex items-center gap-2 bg-white/10 border border-white/20 rounded-xl p-1 pr-2.5">
+            <div className="flex items-center gap-1.5 sm:gap-2 pl-1.5 sm:pl-2 border-l border-white/20 shrink-0">
+              <div className="flex items-center gap-2 bg-white/10 border border-white/20 rounded-xl p-1 sm:pr-2.5">
                 <div className="w-8 h-8 rounded-lg bg-white/20 text-white font-bold text-xs flex items-center justify-center shrink-0 shadow-sm">
                   {currentUser.name
                     .replace(/^(mrs\.|mr\.|ms\.|ar\.|adv\.|ca)\s*/i, '')

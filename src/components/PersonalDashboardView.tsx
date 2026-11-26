@@ -1,5 +1,5 @@
 import React, { useState, useEffect, useCallback } from 'react';
-import { User, KRA, KPI, PerformancePeriod, KPISubmission } from '../types';
+import { User, KRA, KPI, PerformancePeriod, KPISubmission, KPIEvidence } from '../types';
 import { api } from '../services/api';
 import { DocumentViewerModal, downloadDataUrl } from './DocumentViewerModal';
 import {
@@ -68,6 +68,8 @@ export const PersonalDashboardView: React.FC<PersonalDashboardViewProps> = ({
   const [isLoading, setIsLoading] = useState<boolean>(true);
   const [isSubmitModalOpen, setIsSubmitModalOpen] = useState<boolean>(false);
   const [inspectingDoc, setInspectingDoc] = useState<KPISubmission | null>(null);
+  const [evidence, setEvidence] = useState<KPIEvidence[]>([]);
+  const [inspectingEvidence, setInspectingEvidence] = useState<KPIEvidence | null>(null);
 
   // New Submission Form State
   const [selectedKpiId, setSelectedKpiId] = useState<string>('');
@@ -109,8 +111,13 @@ export const PersonalDashboardView: React.FC<PersonalDashboardViewProps> = ({
     async (showSpinner = true) => {
       if (showSpinner) setIsLoading(true);
       try {
-        const [allSubs, rollup] = await Promise.all([api.getSubmissions(), api.getHierarchyRollup(currentPeriod.id)]);
+        const [allSubs, rollup, ev] = await Promise.all([
+          api.getSubmissions(),
+          api.getHierarchyRollup(currentPeriod.id),
+          isSuperAdmin ? Promise.resolve([] as KPIEvidence[]) : api.getEvidence(),
+        ]);
         setSubmissions(allSubs);
+        setEvidence(ev);
         setHierarchyRollup(rollup);
       } catch (err: any) {
         notify(err?.message || 'Failed to load your dashboard data', 'error');
@@ -118,7 +125,7 @@ export const PersonalDashboardView: React.FC<PersonalDashboardViewProps> = ({
         setIsLoading(false);
       }
     },
-    [currentPeriod.id, notify]
+    [currentPeriod.id, notify, isSuperAdmin]
   );
 
   useEffect(() => {
@@ -320,7 +327,7 @@ export const PersonalDashboardView: React.FC<PersonalDashboardViewProps> = ({
   const myPendingCount = mySubmissions.filter((s) => s.status === 'PENDING_APPROVAL').length;
 
   const levelBadge = isSuperAdmin
-    ? { label: 'Super Admin', bg: 'bg-rose-500/20 text-rose-200 border-rose-400/30' }
+    ? { label: 'Super Admin', bg: 'bg-sky-500/20 text-sky-200 border-sky-400/30' }
     : isLevel1
     ? { label: 'Head of Department', bg: 'bg-amber-500/20 text-amber-300 border-amber-500/30' }
     : isLevel2
@@ -480,6 +487,82 @@ export const PersonalDashboardView: React.FC<PersonalDashboardViewProps> = ({
     </div>
   );
 
+  // Decided submissions stay reachable (with their documents) after they leave the approval queue
+  const recentDecisionsPanel = (
+    <div className="bg-white rounded-2xl border border-slate-200 shadow-xs overflow-hidden">
+        <div className="px-5 py-4 border-b border-slate-100 bg-slate-50/50">
+          <span className="text-xs font-bold text-slate-800 uppercase tracking-wider">Recent Decisions</span>
+        </div>
+        <div className="divide-y divide-slate-100 max-h-[320px] overflow-y-auto">
+          {decidedByTeam.length === 0 ? (
+            <div className="p-5 text-center text-xs text-slate-400">No approvals or revisions yet.</div>
+          ) : (
+            decidedByTeam.slice(0, 15).map((sub) => (
+              <div key={sub.id} className="p-3 flex items-center justify-between gap-3 text-xs">
+                <div className="min-w-0">
+                  <div className="font-semibold text-slate-800 truncate">
+                    {sub.employeeName} • <span className="font-mono text-indigo-600">{sub.kpiCode}</span>
+                  </div>
+                  <div className="text-[10px] text-slate-500 truncate">
+                    {sub.approvedDate} by {sub.approvedBy || '—'} • {periodName(sub.periodId)}
+                  </div>
+                </div>
+                <div className="flex items-center gap-2 shrink-0">
+                  {statusChip(sub)}
+                  <button onClick={() => handleViewDoc(sub)} className="p-1 hover:bg-slate-100 rounded text-slate-600" title="View document">
+                    <Eye className="w-3.5 h-3.5" />
+                  </button>
+                </div>
+              </div>
+            ))
+          )}
+        </div>
+      </div>
+  );
+
+  // Evidence other people attached (in Reconciliation) to KPIs this user owns or is assigned
+  const myKpiIds = new Set(submissionKpis.map((k) => k.id));
+  const mySubmissionEvidenceIds = new Set(submissions.filter((s) => s.employeeId === currentUser.id).map((s) => `ev-${s.id}`));
+  const sharedEvidence = evidence.filter(
+    (e) => myKpiIds.has(e.kpiId) && !e.isRestricted && !mySubmissionEvidenceIds.has(e.id) && e.uploadedBy !== currentUser.name
+  );
+  const kpiCodeOf = (kpiId: string) => kpis.find((k) => k.id === kpiId)?.kpiCode || kpiId;
+
+  const sharedEvidencePanel = (
+    <div className="bg-white rounded-2xl border border-slate-200 shadow-xs overflow-hidden">
+      <div className="px-5 py-4 border-b border-slate-100 bg-slate-50/50 flex items-center justify-between">
+        <span className="text-xs font-bold text-slate-800 uppercase tracking-wider">Documents Shared With Me ({sharedEvidence.length})</span>
+        <span className="text-[11px] text-slate-500">Evidence attached to your KPIs</span>
+      </div>
+      <div className="divide-y divide-slate-100 max-h-[320px] overflow-y-auto">
+        {sharedEvidence.length === 0 ? (
+          <div className="p-5 text-center text-xs text-slate-400">No documents have been attached to your KPIs by others yet.</div>
+        ) : (
+          sharedEvidence.map((ev) => (
+            <div key={ev.id} className="p-3 flex items-center justify-between gap-3 text-xs">
+              <div className="min-w-0">
+                <div className="font-semibold text-slate-800 truncate flex items-center gap-1.5">
+                  <FileText className="w-3.5 h-3.5 text-indigo-600 shrink-0" />
+                  {ev.fileName}
+                </div>
+                <div className="text-[10px] text-slate-500 truncate">
+                  <span className="font-mono text-indigo-600">{kpiCodeOf(ev.kpiId)}</span> • {periodName(ev.periodId)} • by {ev.uploadedBy} on{' '}
+                  {ev.uploadedDate}
+                </div>
+              </div>
+              <button
+                onClick={() => setInspectingEvidence(ev)}
+                className="px-2 py-1 bg-slate-100 hover:bg-slate-200 text-slate-700 rounded-lg text-[11px] font-semibold flex items-center gap-1 shrink-0"
+              >
+                <Eye className="w-3.5 h-3.5" /> View
+              </button>
+            </div>
+          ))
+        )}
+      </div>
+    </div>
+  );
+
   return (
     <div className="p-4 sm:p-6 lg:p-8 space-y-6 max-w-7xl mx-auto">
       {/* Personalized Hero Banner */}
@@ -521,7 +604,7 @@ export const PersonalDashboardView: React.FC<PersonalDashboardViewProps> = ({
       </div>
 
       {isSuperAdmin && (
-        <div className="p-4 rounded-2xl border border-rose-200 bg-rose-50 text-xs text-rose-900 flex items-start gap-2">
+        <div className="p-4 rounded-2xl border border-indigo-200 bg-indigo-50 text-xs text-indigo-900 flex items-start gap-2">
           <Info className="w-4 h-4 shrink-0 mt-0.5" />
           <span>
             <strong>Super Admin account.</strong> You govern the whole system and can approve any pending deliverable, but you do
@@ -694,6 +777,7 @@ export const PersonalDashboardView: React.FC<PersonalDashboardViewProps> = ({
       {!isSuperAdmin && (
         <div className="grid grid-cols-1 lg:grid-cols-12 gap-6">
           <div className={`${isApprover ? 'lg:col-span-7' : 'lg:col-span-12'} space-y-6`}>
+            {sharedEvidence.length > 0 && sharedEvidencePanel}
             <div className="bg-white rounded-2xl p-5 border border-slate-200 shadow-xs flex flex-col sm:flex-row sm:items-center justify-between gap-4">
               <div>
                 <h3 className="text-base font-bold text-slate-900 flex items-center gap-2">
@@ -765,7 +849,12 @@ export const PersonalDashboardView: React.FC<PersonalDashboardViewProps> = ({
             </div>
           </div>
 
-          {isApprover && <div className="lg:col-span-5 space-y-6">{approvalQueuePanel}</div>}
+          {isApprover && (
+            <div className="lg:col-span-5 space-y-6">
+              {approvalQueuePanel}
+              {recentDecisionsPanel}
+            </div>
+          )}
         </div>
       )}
       {/* Super Admin: no own deliverables, only the department-wide approval queue */}
@@ -773,37 +862,7 @@ export const PersonalDashboardView: React.FC<PersonalDashboardViewProps> = ({
         <div className="grid grid-cols-1 lg:grid-cols-12 gap-6">
           <div className="lg:col-span-7 space-y-6">{approvalQueuePanel}</div>
           <div className="lg:col-span-5 space-y-6">
-            {isApprover && (
-              <div className="bg-white rounded-2xl border border-slate-200 shadow-xs overflow-hidden">
-                <div className="px-5 py-4 border-b border-slate-100 bg-slate-50/50">
-                  <span className="text-xs font-bold text-slate-800 uppercase tracking-wider">Recent Decisions</span>
-                </div>
-                <div className="divide-y divide-slate-100 max-h-[320px] overflow-y-auto">
-                  {decidedByTeam.length === 0 ? (
-                    <div className="p-5 text-center text-xs text-slate-400">No approvals or revisions yet.</div>
-                  ) : (
-                    decidedByTeam.slice(0, 15).map((sub) => (
-                      <div key={sub.id} className="p-3 flex items-center justify-between gap-3 text-xs">
-                        <div className="min-w-0">
-                          <div className="font-semibold text-slate-800 truncate">
-                            {sub.employeeName} • <span className="font-mono text-indigo-600">{sub.kpiCode}</span>
-                          </div>
-                          <div className="text-[10px] text-slate-500 truncate">
-                            {sub.approvedDate} by {sub.approvedBy || '—'} • {periodName(sub.periodId)}
-                          </div>
-                        </div>
-                        <div className="flex items-center gap-2 shrink-0">
-                          {statusChip(sub)}
-                          <button onClick={() => handleViewDoc(sub)} className="p-1 hover:bg-slate-100 rounded text-slate-600" title="View document">
-                            <Eye className="w-3.5 h-3.5" />
-                          </button>
-                        </div>
-                      </div>
-                    ))
-                  )}
-                </div>
-              </div>
-            )}
+            {recentDecisionsPanel}
           </div>
         </div>
       )}
@@ -984,6 +1043,26 @@ export const PersonalDashboardView: React.FC<PersonalDashboardViewProps> = ({
             </div>
           }
           onClose={() => setInspectingDoc(null)}
+        />
+      )}
+
+      {inspectingEvidence && (
+        <DocumentViewerModal
+          fileName={inspectingEvidence.fileName}
+          subtitle={`Attached by ${inspectingEvidence.uploadedBy} on ${inspectingEvidence.uploadedDate} • ${kpiCodeOf(inspectingEvidence.kpiId)}`}
+          load={async () =>
+            inspectingEvidence.hasFile
+              ? api.getEvidenceDocument(inspectingEvidence.id)
+              : { fileName: inspectingEvidence.fileName, fileType: inspectingEvidence.fileType, fileData: '', hasFile: false }
+          }
+          details={
+            inspectingEvidence.description ? (
+              <span>
+                <strong className="text-slate-700">Description:</strong> {inspectingEvidence.description}
+              </span>
+            ) : undefined
+          }
+          onClose={() => setInspectingEvidence(null)}
         />
       )}
 

@@ -186,6 +186,10 @@ export interface KPIMeasurement {
   approvalStatus: MeasurementApprovalStatus;
   calculatedAutomatically: boolean;
   isManuallyOverridden: boolean;
+  /** Set when the actual came from an approved staff deliverable; auto-calculation never overwrites it */
+  sourceSubmissionId?: string;
+  /** Computed on the fly for a quarter from its monthly actuals (not stored, read-only) */
+  isDerivedRollup?: boolean;
   originalCalculatedValue?: number;
   overrideReason?: string;
   overrideBy?: string;
@@ -216,6 +220,8 @@ export interface KPIEvidence {
   documentUrl?: string;
   /** True when an uploaded file is stored for this evidence (fetch it from /api/evidence/:id/document) */
   hasFile?: boolean;
+  /** True when the signed-in user may not open this evidence file */
+  isRestricted?: boolean;
 }
 
 export interface KPISubmissionDocument {
@@ -613,6 +619,8 @@ export interface PerformanceReview {
   reviewerId: string;
   reviewerName: string;
   overallScore: number;
+  /** Score for the same period computed live by the engine (what the dashboard shows) */
+  liveScore?: number;
   performanceSummary: string;
   majorAchievements: string;
   identifiedProblems: string;

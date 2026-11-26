@@ -456,6 +456,14 @@ export const PerformanceEntryApprovalView: React.FC<PerformanceEntryApprovalView
                                   <Database className="w-2.5 h-2.5" /> Auto
                                 </span>
                               )}
+                              {msr?.isDerivedRollup && (
+                                <span
+                                  className="text-sky-700 font-bold bg-sky-50 px-1 rounded border border-sky-200"
+                                  title={msr.comments}
+                                >
+                                  Quarter roll-up of months
+                                </span>
+                              )}
                               {hasOverride && (
                                 <span className="text-amber-600 font-bold bg-amber-50 px-1 rounded border border-amber-200">
                                   Override Authorized

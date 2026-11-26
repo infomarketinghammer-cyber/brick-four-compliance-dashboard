@@ -171,9 +171,17 @@ export function computeKRAScore(
 
   const kpiDetails = kraKpis.map((kpi) => {
     const measurement = measurementsMap.get(kpi.id);
-    const actual = measurement ? measurement.actual : 0;
-    const target = measurement ? measurement.target : kpi.targetValue;
-    const calc = calculateKPIAchievement(kpi, actual, target, settings);
+    // An unmeasured KPI earns nothing. (Scoring it as actual = 0 made every LOWER_IS_BETTER KPI,
+    // e.g. "0 days TAT" or "0 overdue items", look perfect, so empty periods showed a positive score.)
+    const calc: CalculationResult = measurement
+      ? calculateKPIAchievement(kpi, measurement.actual, measurement.target, settings)
+      : {
+          actual: 0,
+          achievement: 0,
+          weightedScore: 0,
+          status: 'BEHIND',
+          formulaDescription: 'Not measured in this period: scores 0 until an actual is recorded.',
+        };
     totalWeightedScore += calc.weightedScore;
     totalKpiWeight += kpi.weight;
     return { kpi, measurement, calc };
@@ -309,7 +317,7 @@ export function generateScoreExplainabilityTree(
         operationalSource: kpi.dataSource,
         operationalMetricsSummary: measurement
           ? `Target: ${target} ${kpi.unit}, Actual: ${calc.actual} ${kpi.unit}, Weight in KRA: ${kpi.weight}%`
-          : `No measurement recorded for this period (actual treated as 0). Weight in KRA: ${kpi.weight}%`,
+          : `No measurement recorded for this period (scores 0). Weight in KRA: ${kpi.weight}%`,
         isManuallyOverridden: measurement?.isManuallyOverridden ?? false,
         overrideReason: measurement?.overrideReason,
         overrideBy: measurement?.overrideBy,

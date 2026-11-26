@@ -134,7 +134,9 @@ export const ReviewsView: React.FC<ReviewsViewProps> = ({
           </div>
         )}
         {visibleReviews.map((rev) => {
-          const band = scoreBand(rev.overallScore);
+          const shownScore = rev.liveScore ?? rev.overallScore;
+          const band = scoreBand(shownScore);
+          const changedSincePublication = rev.liveScore !== undefined && Math.abs(rev.liveScore - rev.overallScore) >= 0.01;
           return (
             <div key={rev.id} className="bg-white rounded-3xl border border-slate-200 p-6 lg:p-8 shadow-2xs space-y-6">
               <div className="flex flex-col sm:flex-row sm:items-center justify-between pb-4 border-b border-slate-200 gap-4">
@@ -156,8 +158,13 @@ export const ReviewsView: React.FC<ReviewsViewProps> = ({
                   <div>
                     <div className="text-[10px] font-bold uppercase">Department Score</div>
                     <div className="text-xl font-black">
-                      {rev.overallScore}% ({band.label})
+                      {shownScore}% ({band.label})
                     </div>
+                    {changedSincePublication && (
+                      <div className="text-[10px] font-semibold opacity-80" title="Measurements for this period changed after the review was published">
+                        Was {rev.overallScore}% when published
+                      </div>
+                    )}
                   </div>
                 </div>
               </div>
